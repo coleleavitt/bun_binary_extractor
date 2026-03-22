@@ -43,11 +43,23 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     let binary = BunBinary::from_file(&cli.binary_path)?;
 
     if cli.verbose {
-        eprintln!("Embed method: {:?}", binary.embed_method);
+        eprintln!("Detected version: {}", binary.version);
+        eprintln!("Embed method: {}", binary.embed_method);
         eprintln!("Payload base: 0x{:x}", binary.payload_base);
         eprintln!("Module struct size: {} bytes", binary.module_struct_size);
         eprintln!("Module count: {}", binary.modules.len());
         eprintln!("Entry point: {}", binary.offsets.entry_point_id);
+        if binary.offsets.flags != 0 {
+            let flags = binary.offsets.decoded_flags();
+            eprintln!("Flags: {:#010x}", binary.offsets.flags);
+            eprintln!("  disable_env_files: {}", flags.disable_default_env_files);
+            eprintln!("  disable_bunfig: {}", flags.disable_autoload_bunfig);
+            eprintln!("  disable_tsconfig: {}", flags.disable_autoload_tsconfig);
+            eprintln!(
+                "  disable_package_json: {}",
+                flags.disable_autoload_package_json
+            );
+        }
         if let Some(argv) = binary.argv() {
             eprintln!("Argv: {argv}");
         }
@@ -55,9 +67,10 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!(
-        "Found {} modules in {:?}",
+        "Found {} modules in {:?} ({})",
         binary.modules.len(),
-        cli.binary_path
+        cli.binary_path,
+        binary.version,
     );
     println!();
 
@@ -74,11 +87,12 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_default();
 
         println!(
-            "  [{:>2}] {} ({}, {} bytes, {}, {}){}{sm_info}",
+            "  [{:>2}] {} ({}, {} bytes, {}, {}, {}){}{sm_info}",
             module.index,
             module.name,
             module.file_type(),
             module.contents.len(),
+            module.loader.as_str(),
             module.encoding.as_str(),
             module.module_format.as_str(),
             entry_marker,
@@ -94,7 +108,10 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut extracted = 0;
     for module in &binary.modules {
-        if cli.js_only && !matches!(module.file_type(), "JavaScript" | "TypeScript") {
+        if cli.js_only
+            && !module.loader.is_javascript()
+            && !matches!(module.file_type(), "JavaScript" | "TypeScript")
+        {
             continue;
         }
 

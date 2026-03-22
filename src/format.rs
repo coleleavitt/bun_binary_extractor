@@ -1,8 +1,7 @@
+use std::fmt;
+
 /// The magic trailer that Bun appends to compiled binaries.
 pub const TRAILER: &[u8; 16] = b"\n---- Bun! ----\n";
-
-/// Size of the Offsets struct in bytes.
-pub const OFFSETS_SIZE: usize = 32;
 
 /// Virtual path prefix on Unix systems (stripped when extracting).
 pub const BUNFS_PREFIX_UNIX: &str = "/$bunfs/root/";
@@ -10,16 +9,53 @@ pub const BUNFS_PREFIX_UNIX: &str = "/$bunfs/root/";
 /// Virtual path prefix on Windows systems.
 pub const BUNFS_PREFIX_WIN: &str = "B:\\~BUN\\";
 
-/// Candidate module struct sizes to try during auto-detection.
-/// Ordered by likelihood (72 is most common in Bun 1.x).
-pub const CANDIDATE_STRUCT_SIZES: &[usize] = &[
-    72, 68, 64, 60, 56, 52, 80, 84, 88, 76, 48, 96, 104, 112, 120, 128,
-];
-
 /// Module name prefix used to validate struct size detection.
 pub const MODULE_NAME_PREFIX: &str = "/$bunfs/";
 
-/// The 32-byte offsets structure found just before the trailer.
+/// ELF magic bytes.
+pub const ELF_MAGIC: &[u8; 4] = b"\x7fELF";
+
+/// PE magic bytes (MZ header).
+pub const PE_MAGIC: &[u8; 2] = b"MZ";
+
+/// Mach-O 64-bit magic (little-endian).
+pub const MACHO_MAGIC_64: u32 = 0xFEED_FACF;
+
+/// Mach-O FAT magic.
+pub const MACHO_FAT_MAGIC: u32 = 0xCAFE_BABE;
+
+/// Bun section name in PE/ELF binaries.
+pub const BUN_SECTION_NAME: &str = ".bun";
+
+/// Mach-O segment name for Bun data.
+pub const MACHO_SEGMENT_NAME: &[u8; 16] = b"__BUN\0\0\0\0\0\0\0\0\0\0\0";
+
+/// Mach-O section name for Bun data.
+pub const MACHO_SECTION_NAME: &[u8; 16] = b"__bun\0\0\0\0\0\0\0\0\0\0\0";
+
+/// Candidate module struct sizes to try during auto-detection.
+/// Includes sizes from all known Bun versions and Zig compiler outputs.
+/// - 36: Bun <=1.1 (4 SPs + 4 enum bytes, packed)
+/// - 52: Bun >=1.2 (6 SPs + 4 enum bytes, packed)
+/// - 72: Bun 1.3.x on x86_64-linux (Zig non-extern struct with padding)
+/// - Others: Various Zig compiler versions/targets may produce different padding.
+pub const CANDIDATE_STRUCT_SIZES: &[usize] = &[
+    72, 52, 36, 68, 64, 60, 56, 80, 84, 88, 76, 48, 40, 44, 96, 104, 112, 120, 128,
+];
+
+/// Possible Offsets struct sizes across Bun versions.
+/// - 28: Bun <=1.3.x (no flags field, but C ABI pads to 32)
+/// - 32: Bun 1.4+ (has flags field)
+///   Both parse identically because the padding/flags occupy the same 4 bytes.
+pub const OFFSETS_SIZE: usize = 32;
+
+/// The Offsets struct found just before the trailer.
+///
+/// ## Bun version differences
+/// - **Bun <=1.3.x**: 28 bytes (no `flags`), padded to 32 by C ABI alignment.
+/// - **Bun 1.4+**: 32 bytes (explicit `flags: u32` field).
+///
+/// We always read 32 bytes; the `flags` field is zero on older versions.
 #[derive(Debug, Clone, Copy)]
 pub struct Offsets {
     /// Total payload size (NOT including Offsets and trailer).
@@ -34,12 +70,12 @@ pub struct Offsets {
     pub argv_offset: u32,
     /// Length of the argv string.
     pub argv_length: u32,
-    /// Feature flags bitfield.
+    /// Feature flags bitfield (zero on Bun <=1.3.x).
     pub flags: u32,
 }
 
 impl Offsets {
-    /// Parse Offsets from a 32-byte slice (little-endian).
+    /// Parse Offsets from a 32-byte little-endian slice.
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
         if data.len() < OFFSETS_SIZE {
             return None;
@@ -54,6 +90,25 @@ impl Offsets {
             flags: u32::from_le_bytes(data[28..32].try_into().ok()?),
         })
     }
+
+    /// Decode feature flags.
+    pub fn decoded_flags(&self) -> OffsetsFlags {
+        OffsetsFlags {
+            disable_default_env_files: self.flags & 1 != 0,
+            disable_autoload_bunfig: self.flags & 2 != 0,
+            disable_autoload_tsconfig: self.flags & 4 != 0,
+            disable_autoload_package_json: self.flags & 8 != 0,
+        }
+    }
+}
+
+/// Decoded Offsets flags (Bun 1.4+ only; all false on older versions).
+#[derive(Debug, Clone, Copy)]
+pub struct OffsetsFlags {
+    pub disable_default_env_files: bool,
+    pub disable_autoload_bunfig: bool,
+    pub disable_autoload_tsconfig: bool,
+    pub disable_autoload_package_json: bool,
 }
 
 /// A pointer to a string within the payload (offset + length).
@@ -64,7 +119,7 @@ pub struct StringPointer {
 }
 
 impl StringPointer {
-    /// Parse a StringPointer from an 8-byte slice (little-endian).
+    /// Parse a StringPointer from an 8-byte little-endian slice.
     pub fn from_bytes(data: &[u8]) -> Option<Self> {
         if data.len() < 8 {
             return None;
@@ -79,10 +134,75 @@ impl StringPointer {
 /// How the payload was embedded in the binary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmbedMethod {
-    /// Appended after the ELF (Bun ≤1.3.x).
+    /// Appended after the original binary with a trailing u64 size.
     Appended,
-    /// Stored in an ELF `.bun` section (Bun 1.4+).
-    Section { section_offset: usize },
+    /// ELF `.bun` section (Bun 1.4+).
+    ElfSection { section_offset: usize },
+    /// PE `.bun` section (Windows).
+    PeSection { section_offset: usize },
+    /// Mach-O `__BUN,__bun` section (macOS).
+    MachoSection { section_offset: usize },
+}
+
+impl fmt::Display for EmbedMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EmbedMethod::Appended => write!(f, "Appended (legacy)"),
+            EmbedMethod::ElfSection { section_offset } => {
+                write!(f, "ELF .bun section (offset {section_offset:#x})")
+            }
+            EmbedMethod::PeSection { section_offset } => {
+                write!(f, "PE .bun section (offset {section_offset:#x})")
+            }
+            EmbedMethod::MachoSection { section_offset } => {
+                write!(f, "Mach-O __BUN/__bun section (offset {section_offset:#x})")
+            }
+        }
+    }
+}
+
+/// Heuristic Bun version range detected from the binary format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BunVersion {
+    /// Bun <=1.1: 4 StringPointers, 36-byte module struct, no flags.
+    V1_0_1_1,
+    /// Bun 1.2-1.3: 6 StringPointers, 52-byte module struct (or Zig-padded), no flags.
+    V1_2_1_3,
+    /// Bun 1.4+: 6 StringPointers, 52-byte module struct, has flags, ELF section.
+    V1_4Plus,
+    /// Unknown version; auto-detection still worked.
+    Unknown,
+}
+
+impl BunVersion {
+    /// Heuristically detect the Bun version from format characteristics.
+    pub fn detect(embed_method: &EmbedMethod, module_struct_size: usize, flags: u32) -> Self {
+        match embed_method {
+            EmbedMethod::ElfSection { .. }
+            | EmbedMethod::PeSection { .. }
+            | EmbedMethod::MachoSection { .. } => BunVersion::V1_4Plus,
+            EmbedMethod::Appended => {
+                if flags != 0 {
+                    BunVersion::V1_4Plus
+                } else if module_struct_size <= 36 {
+                    BunVersion::V1_0_1_1
+                } else {
+                    BunVersion::V1_2_1_3
+                }
+            }
+        }
+    }
+}
+
+impl fmt::Display for BunVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BunVersion::V1_0_1_1 => write!(f, "Bun <=1.1"),
+            BunVersion::V1_2_1_3 => write!(f, "Bun 1.2-1.3"),
+            BunVersion::V1_4Plus => write!(f, "Bun 1.4+"),
+            BunVersion::Unknown => write!(f, "Unknown"),
+        }
+    }
 }
 
 /// Module encoding type.
@@ -111,6 +231,87 @@ impl Encoding {
             Encoding::Utf8 => "utf8",
             Encoding::Unknown(_) => "unknown",
         }
+    }
+}
+
+/// Bun file loader type (matches `bun.options.Loader` enum(u8) from Bun source).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Loader {
+    Jsx,
+    Js,
+    Ts,
+    Tsx,
+    Css,
+    File,
+    Json,
+    Jsonc,
+    Toml,
+    Wasm,
+    Napi,
+    Base64,
+    DataUrl,
+    Text,
+    BunSh,
+    Sqlite,
+    SqliteEmbedded,
+    Html,
+    Yaml,
+    Unknown(u8),
+}
+
+impl Loader {
+    pub fn from_u8(val: u8) -> Self {
+        match val {
+            0 => Loader::Jsx,
+            1 => Loader::Js,
+            2 => Loader::Ts,
+            3 => Loader::Tsx,
+            4 => Loader::Css,
+            5 => Loader::File,
+            6 => Loader::Json,
+            7 => Loader::Jsonc,
+            8 => Loader::Toml,
+            9 => Loader::Wasm,
+            10 => Loader::Napi,
+            11 => Loader::Base64,
+            12 => Loader::DataUrl,
+            13 => Loader::Text,
+            14 => Loader::BunSh,
+            15 => Loader::Sqlite,
+            16 => Loader::SqliteEmbedded,
+            17 => Loader::Html,
+            18 => Loader::Yaml,
+            other => Loader::Unknown(other),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Loader::Jsx => "jsx",
+            Loader::Js => "js",
+            Loader::Ts => "ts",
+            Loader::Tsx => "tsx",
+            Loader::Css => "css",
+            Loader::File => "file",
+            Loader::Json => "json",
+            Loader::Jsonc => "jsonc",
+            Loader::Toml => "toml",
+            Loader::Wasm => "wasm",
+            Loader::Napi => "napi",
+            Loader::Base64 => "base64",
+            Loader::DataUrl => "dataurl",
+            Loader::Text => "text",
+            Loader::BunSh => "bunsh",
+            Loader::Sqlite => "sqlite",
+            Loader::SqliteEmbedded => "sqlite_embedded",
+            Loader::Html => "html",
+            Loader::Yaml => "yaml",
+            Loader::Unknown(_) => "unknown",
+        }
+    }
+
+    pub fn is_javascript(&self) -> bool {
+        matches!(self, Loader::Js | Loader::Jsx | Loader::Ts | Loader::Tsx)
     }
 }
 
@@ -143,6 +344,32 @@ impl ModuleFormat {
     }
 }
 
+/// Module side (server vs client).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileSide {
+    Server,
+    Client,
+    Unknown(u8),
+}
+
+impl FileSide {
+    pub fn from_u8(val: u8) -> Self {
+        match val {
+            0 => FileSide::Server,
+            1 => FileSide::Client,
+            other => FileSide::Unknown(other),
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FileSide::Server => "server",
+            FileSide::Client => "client",
+            FileSide::Unknown(_) => "unknown",
+        }
+    }
+}
+
 /// Extracted module information.
 #[derive(Debug)]
 pub struct Module {
@@ -151,7 +378,9 @@ pub struct Module {
     pub contents: Vec<u8>,
     pub sourcemap: Option<Vec<u8>>,
     pub encoding: Encoding,
+    pub loader: Loader,
     pub module_format: ModuleFormat,
+    pub side: FileSide,
     pub is_entry_point: bool,
 }
 
@@ -165,8 +394,15 @@ impl Module {
             .unwrap_or(&self.name)
     }
 
-    /// Guess the file type from the extension.
+    /// Guess the file type from the extension and loader.
     pub fn file_type(&self) -> &'static str {
+        if self.loader.is_javascript() {
+            return match self.loader {
+                Loader::Ts | Loader::Tsx => "TypeScript",
+                _ => "JavaScript",
+            };
+        }
+
         let name = self.name.to_lowercase();
         if name.ends_with(".js") || name.ends_with(".mjs") || name.ends_with(".cjs") {
             "JavaScript"
@@ -186,6 +422,10 @@ impl Module {
             "Text"
         } else if name.ends_with(".toml") {
             "TOML"
+        } else if name.ends_with(".scm") {
+            "Scheme/Query"
+        } else if name.ends_with(".sql") || name.ends_with(".sqlite") {
+            "SQLite"
         } else {
             "Unknown"
         }

@@ -3,8 +3,8 @@ use std::path::Path;
 
 use crate::error::ExtractError;
 use crate::format::{
-    EmbedMethod, Encoding, Module, ModuleFormat, Offsets, StringPointer, CANDIDATE_STRUCT_SIZES,
-    MODULE_NAME_PREFIX, OFFSETS_SIZE, TRAILER,
+    BunVersion, EmbedMethod, Encoding, FileSide, Loader, Module, ModuleFormat, Offsets,
+    StringPointer, CANDIDATE_STRUCT_SIZES, MODULE_NAME_PREFIX, OFFSETS_SIZE, TRAILER,
 };
 
 pub struct BunBinary {
@@ -14,6 +14,7 @@ pub struct BunBinary {
     pub payload_base: usize,
     pub module_struct_size: usize,
     pub modules: Vec<Module>,
+    pub version: BunVersion,
 }
 
 impl BunBinary {
@@ -24,7 +25,6 @@ impl BunBinary {
 
     pub fn parse(data: Vec<u8>) -> Result<Self, ExtractError> {
         let file_size = data.len();
-        // Minimum: 8 (total_byte_count) + 16 (trailer) + 32 (offsets) + some payload
         if file_size < 60 {
             return Err(ExtractError::FileTooSmall { size: file_size });
         }
@@ -33,17 +33,16 @@ impl BunBinary {
 
         let (offsets, payload_base) = match embed_method {
             EmbedMethod::Appended => {
-                // Layout: [ELF][payload][Offsets(32)][trailer(16)][u64 total_byte_count(8)]
-                let offsets_end = file_size - 8 - 16; // skip total_byte_count + trailer
+                let offsets_end = file_size - 8 - 16;
                 let offsets_start = offsets_end - OFFSETS_SIZE;
                 let offsets = Offsets::from_bytes(&data[offsets_start..offsets_end])
                     .ok_or(ExtractError::TrailerNotFound)?;
                 let pbase = offsets_start - offsets.byte_count as usize;
                 (offsets, pbase)
             }
-            EmbedMethod::Section { section_offset } => {
-                // Section data: [u64 LE payload_len][payload_len bytes]
-                // The payload ends with: [Offsets(32)][trailer(16)]
+            EmbedMethod::ElfSection { section_offset }
+            | EmbedMethod::PeSection { section_offset }
+            | EmbedMethod::MachoSection { section_offset } => {
                 let payload_len = u64::from_le_bytes(
                     data[section_offset..section_offset + 8]
                         .try_into()
@@ -52,8 +51,7 @@ impl BunBinary {
                 let section_payload_start = section_offset + 8;
                 let section_payload_end = section_payload_start + payload_len;
 
-                // Offsets are at end of section payload, before trailer
-                let offsets_end = section_payload_end - 16; // skip trailer
+                let offsets_end = section_payload_end - 16;
                 let offsets_start = offsets_end - OFFSETS_SIZE;
                 let offsets = Offsets::from_bytes(&data[offsets_start..offsets_end])
                     .ok_or(ExtractError::TrailerNotFound)?;
@@ -70,6 +68,7 @@ impl BunBinary {
         )?;
 
         let modules = parse_modules(&data, payload_base, &offsets, module_struct_size)?;
+        let version = BunVersion::detect(&embed_method, module_struct_size, offsets.flags);
 
         Ok(BunBinary {
             data,
@@ -78,6 +77,7 @@ impl BunBinary {
             payload_base,
             module_struct_size,
             modules,
+            version,
         })
     }
 
@@ -95,7 +95,6 @@ impl BunBinary {
 fn detect_embed_method(data: &[u8]) -> Result<EmbedMethod, ExtractError> {
     let len = data.len();
 
-    // Check appended approach: last 8 bytes = u64 total_byte_count, then trailer before that
     if len >= 8 + 16 {
         let trailer_start = len - 8 - 16;
         let trailer_end = len - 8;
@@ -104,18 +103,31 @@ fn detect_embed_method(data: &[u8]) -> Result<EmbedMethod, ExtractError> {
         }
     }
 
-    // Check if trailer is at very end
-    if len >= 16 && &data[len - 16..] == TRAILER.as_slice() {
-        // This would be unusual but handle it — treat as section approach
-        // Fall through to ELF parsing
+    if len >= 4 {
+        if &data[0..4] == b"\x7fELF" {
+            if let Ok(method) = find_elf_bun_section(data) {
+                return Ok(method);
+            }
+        }
+
+        if len >= 2 && &data[0..2] == b"MZ" {
+            if let Ok(method) = find_pe_bun_section(data) {
+                return Ok(method);
+            }
+        }
+
+        let magic32 = u32::from_le_bytes(data[0..4].try_into().unwrap_or([0; 4]));
+        if magic32 == 0xFEED_FACF || magic32 == 0xFEED_FACE {
+            if let Ok(method) = find_macho_bun_section(data) {
+                return Ok(method);
+            }
+        }
     }
 
-    // Parse ELF to find .bun section
-    find_bun_elf_section(data)
+    Err(ExtractError::TrailerNotFound)
 }
 
-fn find_bun_elf_section(data: &[u8]) -> Result<EmbedMethod, ExtractError> {
-    // Verify ELF magic
+fn find_elf_bun_section(data: &[u8]) -> Result<EmbedMethod, ExtractError> {
     if data.len() < 64 || &data[0..4] != b"\x7fELF" {
         return Err(ExtractError::TrailerNotFound);
     }
@@ -125,7 +137,6 @@ fn find_bun_elf_section(data: &[u8]) -> Result<EmbedMethod, ExtractError> {
         return Err(ExtractError::InvalidElf);
     }
 
-    // ELF64 header fields (little-endian assumed)
     let e_shoff = u64::from_le_bytes(
         data[40..48]
             .try_into()
@@ -151,7 +162,6 @@ fn find_bun_elf_section(data: &[u8]) -> Result<EmbedMethod, ExtractError> {
         return Err(ExtractError::BunSectionNotFound);
     }
 
-    // Read section header string table
     let shstrtab_hdr_off = e_shoff + e_shstrndx * e_shentsize;
     if shstrtab_hdr_off + e_shentsize > data.len() {
         return Err(ExtractError::InvalidElf);
@@ -172,7 +182,6 @@ fn find_bun_elf_section(data: &[u8]) -> Result<EmbedMethod, ExtractError> {
     }
     let shstrtab = &data[shstrtab_offset..shstrtab_offset + shstrtab_size];
 
-    // Iterate sections to find ".bun"
     for i in 0..e_shnum {
         let hdr_off = e_shoff + i * e_shentsize;
         if hdr_off + e_shentsize > data.len() {
@@ -199,11 +208,144 @@ fn find_bun_elf_section(data: &[u8]) -> Result<EmbedMethod, ExtractError> {
                         .try_into()
                         .map_err(|_| ExtractError::InvalidElf)?,
                 ) as usize;
-                return Ok(EmbedMethod::Section {
+                return Ok(EmbedMethod::ElfSection {
                     section_offset: sh_offset,
                 });
             }
         }
+    }
+
+    Err(ExtractError::BunSectionNotFound)
+}
+
+fn find_pe_bun_section(data: &[u8]) -> Result<EmbedMethod, ExtractError> {
+    if data.len() < 0x40 || &data[0..2] != b"MZ" {
+        return Err(ExtractError::TrailerNotFound);
+    }
+
+    let pe_offset = u32::from_le_bytes(
+        data[0x3C..0x40]
+            .try_into()
+            .map_err(|_| ExtractError::TrailerNotFound)?,
+    ) as usize;
+
+    if pe_offset + 24 > data.len() || &data[pe_offset..pe_offset + 4] != b"PE\0\0" {
+        return Err(ExtractError::TrailerNotFound);
+    }
+
+    let num_sections = u16::from_le_bytes(
+        data[pe_offset + 6..pe_offset + 8]
+            .try_into()
+            .map_err(|_| ExtractError::TrailerNotFound)?,
+    ) as usize;
+    let opt_hdr_size = u16::from_le_bytes(
+        data[pe_offset + 20..pe_offset + 22]
+            .try_into()
+            .map_err(|_| ExtractError::TrailerNotFound)?,
+    ) as usize;
+    let section_table = pe_offset + 24 + opt_hdr_size;
+
+    for i in 0..num_sections {
+        let sec_off = section_table + i * 40;
+        if sec_off + 40 > data.len() {
+            break;
+        }
+
+        let name = &data[sec_off..sec_off + 8];
+        let trimmed = std::str::from_utf8(&name[..name.iter().position(|&b| b == 0).unwrap_or(8)])
+            .unwrap_or("");
+
+        if trimmed == ".bun" {
+            let raw_size = u32::from_le_bytes(
+                data[sec_off + 16..sec_off + 20]
+                    .try_into()
+                    .map_err(|_| ExtractError::TrailerNotFound)?,
+            ) as usize;
+            let raw_offset = u32::from_le_bytes(
+                data[sec_off + 20..sec_off + 24]
+                    .try_into()
+                    .map_err(|_| ExtractError::TrailerNotFound)?,
+            ) as usize;
+
+            if raw_offset + raw_size <= data.len() {
+                return Ok(EmbedMethod::PeSection {
+                    section_offset: raw_offset,
+                });
+            }
+        }
+    }
+
+    Err(ExtractError::BunSectionNotFound)
+}
+
+fn find_macho_bun_section(data: &[u8]) -> Result<EmbedMethod, ExtractError> {
+    if data.len() < 32 {
+        return Err(ExtractError::TrailerNotFound);
+    }
+
+    let magic = u32::from_le_bytes(
+        data[0..4]
+            .try_into()
+            .map_err(|_| ExtractError::TrailerNotFound)?,
+    );
+    let is_64 = magic == 0xFEED_FACF;
+    if !is_64 && magic != 0xFEED_FACE {
+        return Err(ExtractError::TrailerNotFound);
+    }
+
+    let ncmds = u32::from_le_bytes(
+        data[16..20]
+            .try_into()
+            .map_err(|_| ExtractError::TrailerNotFound)?,
+    ) as usize;
+
+    let header_size: usize = if is_64 { 32 } else { 28 };
+    let mut cursor = header_size;
+
+    for _ in 0..ncmds {
+        if cursor + 8 > data.len() {
+            break;
+        }
+
+        let cmd = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap_or([0; 4]));
+        let cmdsize =
+            u32::from_le_bytes(data[cursor + 4..cursor + 8].try_into().unwrap_or([0; 4])) as usize;
+
+        if cmdsize < 8 || cursor + cmdsize > data.len() {
+            break;
+        }
+
+        let lc_segment_64: u32 = 0x19;
+        if cmd == lc_segment_64 && cmdsize >= 72 {
+            let segname = &data[cursor + 8..cursor + 24];
+            if segname.starts_with(b"__BUN\0") {
+                let nsects =
+                    u32::from_le_bytes(data[cursor + 64..cursor + 68].try_into().unwrap_or([0; 4]))
+                        as usize;
+
+                let mut sec_cursor = cursor + 72;
+                for _ in 0..nsects {
+                    if sec_cursor + 80 > data.len() {
+                        break;
+                    }
+
+                    let sectname = &data[sec_cursor..sec_cursor + 16];
+                    if sectname.starts_with(b"__bun\0") {
+                        let offset = u32::from_le_bytes(
+                            data[sec_cursor + 48..sec_cursor + 52]
+                                .try_into()
+                                .unwrap_or([0; 4]),
+                        ) as usize;
+                        return Ok(EmbedMethod::MachoSection {
+                            section_offset: offset,
+                        });
+                    }
+                    sec_cursor += 80;
+                }
+            }
+        }
+
+        cursor += cmdsize;
     }
 
     Err(ExtractError::BunSectionNotFound)
@@ -271,6 +413,58 @@ fn detect_module_struct_size(
     Err(ExtractError::ModuleSizeDetectionFailed { modules_length })
 }
 
+fn extract_enum_fields(
+    data: &[u8],
+    base: usize,
+    struct_size: usize,
+) -> (Encoding, Loader, ModuleFormat, FileSide) {
+    let defaults = (
+        Encoding::Binary,
+        Loader::File,
+        ModuleFormat::None,
+        FileSide::Server,
+    );
+
+    if struct_size < 36 {
+        return defaults;
+    }
+
+    // v1.3.2 has 4 StringPointers (32 bytes), then 4 enum u8s at offset 32.
+    // But Zig may pad the struct. Try known positions:
+    //   - offset 32: right after 4 SPs (Bun <=1.3 Zig-padded layout)
+    //   - struct_size - 4: last 4 bytes (packed layouts like 36-byte or 52-byte)
+    //   - struct_size - 8: for structs where enums have 4 bytes padding after them
+    let candidates: &[usize] = &[32, struct_size - 4, struct_size - 8];
+
+    for &off in candidates {
+        let pos = base + off;
+        if pos + 4 > data.len() {
+            continue;
+        }
+
+        let enc = data[pos];
+        let ldr = data[pos + 1];
+        let fmt = data[pos + 2];
+        let sid = data[pos + 3];
+
+        let enc_valid = enc <= 2;
+        let ldr_valid = ldr <= 18;
+        let fmt_valid = fmt <= 2;
+        let sid_valid = sid <= 1;
+
+        if enc_valid && ldr_valid && fmt_valid && sid_valid {
+            return (
+                Encoding::from_u8(enc),
+                Loader::from_u8(ldr),
+                ModuleFormat::from_u8(fmt),
+                FileSide::from_u8(sid),
+            );
+        }
+    }
+
+    defaults
+}
+
 fn read_string_pointer<'a>(
     data: &'a [u8],
     payload_base: usize,
@@ -319,7 +513,6 @@ fn parse_modules(
             Vec::new()
         };
 
-        // Sourcemap is the third StringPointer (offset 16)
         let sourcemap = if struct_size >= 24 {
             let sm_sp = StringPointer::from_bytes(&data[base + 16..base + 24])
                 .ok_or(ExtractError::TrailerNotFound)?;
@@ -332,29 +525,7 @@ fn parse_modules(
             None
         };
 
-        // Try to read encoding and module_format from the enum fields at the end of the struct.
-        // These are typically the last few bytes. The exact layout varies, but in the 72-byte
-        // struct they're at offsets that follow all StringPointers.
-        //
-        // Known layout for 72-byte structs (Bun 1.x):
-        // 0..8: name, 8..16: contents, 16..24: sourcemap,
-        // 24..32: bytecode, 32..40: module_info, 40..48: bytecode_origin_path
-        // Then 4 u32 fields (16 bytes) = 64 bytes, then 4 enum u8s + padding = 8 bytes → 72
-        //
-        // The 4 enum bytes are at struct_size - 8 .. struct_size - 4
-        let (encoding, module_format) = if struct_size >= 48 {
-            let enum_base = base + struct_size - 8;
-            if enum_base + 4 <= data.len() {
-                let enc = Encoding::from_u8(data[enum_base]);
-                let _loader = data[enum_base + 1];
-                let mfmt = ModuleFormat::from_u8(data[enum_base + 2]);
-                (enc, mfmt)
-            } else {
-                (Encoding::Binary, ModuleFormat::None)
-            }
-        } else {
-            (Encoding::Binary, ModuleFormat::None)
-        };
+        let (encoding, loader, module_format, side) = extract_enum_fields(data, base, struct_size);
 
         modules.push(Module {
             index: i,
@@ -362,7 +533,9 @@ fn parse_modules(
             contents,
             sourcemap,
             encoding,
+            loader,
             module_format,
+            side,
             is_entry_point: i == offsets.entry_point_id as usize,
         });
     }
