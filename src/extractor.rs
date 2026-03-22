@@ -37,6 +37,25 @@ impl BunBinary {
                 let offsets_start = offsets_end - OFFSETS_SIZE;
                 let offsets = Offsets::from_bytes(&data[offsets_start..offsets_end])
                     .ok_or(ExtractError::TrailerNotFound)?;
+
+                if offsets.byte_count as usize > file_size || offsets.byte_count < 32 {
+                    return Err(ExtractError::InvalidOffsets {
+                        byte_count: offsets.byte_count,
+                    });
+                }
+
+                let total_byte_count = u64::from_le_bytes(
+                    data[file_size - 8..file_size]
+                        .try_into()
+                        .map_err(|_| ExtractError::TrailerNotFound)?,
+                );
+
+                if offsets.byte_count >= total_byte_count {
+                    return Err(ExtractError::InvalidOffsets {
+                        byte_count: offsets.byte_count,
+                    });
+                }
+
                 let pbase = offsets_start - offsets.byte_count as usize;
                 (offsets, pbase)
             }
@@ -66,6 +85,13 @@ impl BunBinary {
             offsets.modules_offset,
             offsets.modules_length,
         )?;
+
+        let n_modules = offsets.modules_length as usize / module_struct_size;
+        if offsets.entry_point_id as usize > n_modules {
+            return Err(ExtractError::InvalidOffsets {
+                byte_count: offsets.byte_count,
+            });
+        }
 
         let modules = parse_modules(&data, payload_base, &offsets, module_struct_size)?;
         let version = BunVersion::detect(&embed_method, module_struct_size, offsets.flags);
