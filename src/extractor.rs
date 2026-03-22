@@ -8,13 +8,13 @@ use crate::format::{
 };
 
 pub struct BunBinary {
-    pub data: Vec<u8>,
     pub embed_method: EmbedMethod,
     pub offsets: Offsets,
     pub payload_base: usize,
     pub module_struct_size: usize,
     pub modules: Vec<Module>,
     pub version: BunVersion,
+    pub argv: Option<String>,
 }
 
 impl BunBinary {
@@ -56,7 +56,11 @@ impl BunBinary {
                     });
                 }
 
-                let pbase = offsets_start - offsets.byte_count as usize;
+                let pbase = offsets_start
+                    .checked_sub(offsets.byte_count as usize)
+                    .ok_or(ExtractError::InvalidOffsets {
+                        byte_count: offsets.byte_count,
+                    })?;
                 (offsets, pbase)
             }
             EmbedMethod::ElfSection { section_offset }
@@ -67,9 +71,16 @@ impl BunBinary {
                         .try_into()
                         .map_err(|_| ExtractError::InvalidElf)?,
                 ) as usize;
-                let section_payload_start = section_offset + 8;
-                let section_payload_end = section_payload_start + payload_len;
+                let section_payload_start = section_offset
+                    .checked_add(8)
+                    .ok_or(ExtractError::OffsetOverflow)?;
+                let section_payload_end = section_payload_start
+                    .checked_add(payload_len)
+                    .ok_or(ExtractError::OffsetOverflow)?;
 
+                if section_payload_end < 16 + OFFSETS_SIZE {
+                    return Err(ExtractError::InvalidOffsets { byte_count: 0 });
+                }
                 let offsets_end = section_payload_end - 16;
                 let offsets_start = offsets_end - OFFSETS_SIZE;
                 let offsets = Offsets::from_bytes(&data[offsets_start..offsets_end])
@@ -93,29 +104,35 @@ impl BunBinary {
             });
         }
 
+        let argv = extract_argv(&data, payload_base, &offsets);
         let modules = parse_modules(&data, payload_base, &offsets, module_struct_size)?;
         let version = BunVersion::detect(&embed_method, module_struct_size, offsets.flags);
 
         Ok(BunBinary {
-            data,
             embed_method,
             offsets,
             payload_base,
             module_struct_size,
             modules,
             version,
+            argv,
         })
     }
+}
 
-    pub fn argv(&self) -> Option<&str> {
-        let start = self.payload_base + self.offsets.argv_offset as usize;
-        let end = start + self.offsets.argv_length as usize;
-        if end <= self.data.len() {
-            std::str::from_utf8(&self.data[start..end]).ok()
-        } else {
-            None
-        }
+fn extract_argv(data: &[u8], payload_base: usize, offsets: &Offsets) -> Option<String> {
+    let start = payload_base.checked_add(offsets.argv_offset as usize)?;
+    let end = start.checked_add(offsets.argv_length as usize)?;
+    if end > data.len() {
+        return None;
     }
+    std::str::from_utf8(&data[start..end])
+        .ok()
+        .map(String::from)
+}
+
+fn checked_offset(base: usize, offset: usize) -> Result<usize, ExtractError> {
+    base.checked_add(offset).ok_or(ExtractError::OffsetOverflow)
 }
 
 fn detect_embed_method(data: &[u8]) -> Result<EmbedMethod, ExtractError> {
@@ -336,7 +353,6 @@ fn find_macho_bun_section(data: &[u8]) -> Result<EmbedMethod, ExtractError> {
             break;
         }
 
-        // bounds already checked at loop head: cursor + 8 <= data.len()
         let cmd = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap());
         let cmdsize = u32::from_le_bytes(data[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
 
@@ -386,7 +402,7 @@ fn detect_module_struct_size(
     modules_offset: u32,
     modules_length: u32,
 ) -> Result<usize, ExtractError> {
-    let mod_array_start = payload_base + modules_offset as usize;
+    let mod_array_start = checked_offset(payload_base, modules_offset as usize)?;
     let mod_len = modules_length as usize;
 
     for &candidate in CANDIDATE_STRUCT_SIZES {
@@ -400,11 +416,13 @@ fn detect_module_struct_size(
 
         let mut all_valid = true;
         for i in 0..n_modules {
-            let entry_start = mod_array_start + i * candidate;
-            if entry_start + 8 > data.len() {
-                all_valid = false;
-                break;
-            }
+            let entry_start = match mod_array_start.checked_add(i * candidate) {
+                Some(v) if v + 8 <= data.len() => v,
+                _ => {
+                    all_valid = false;
+                    break;
+                }
+            };
             let name_ptr = match StringPointer::from_bytes(&data[entry_start..entry_start + 8]) {
                 Some(sp) => sp,
                 None => {
@@ -413,12 +431,20 @@ fn detect_module_struct_size(
                 }
             };
 
-            let name_start = payload_base + name_ptr.offset as usize;
-            let name_end = name_start + name_ptr.length as usize;
-            if name_end > data.len() || name_ptr.length == 0 {
-                all_valid = false;
-                break;
-            }
+            let name_start = match payload_base.checked_add(name_ptr.offset as usize) {
+                Some(v) => v,
+                None => {
+                    all_valid = false;
+                    break;
+                }
+            };
+            let name_end = match name_start.checked_add(name_ptr.length as usize) {
+                Some(v) if v <= data.len() && name_ptr.length > 0 => v,
+                _ => {
+                    all_valid = false;
+                    break;
+                }
+            };
 
             let name = match std::str::from_utf8(&data[name_start..name_end]) {
                 Ok(s) => s,
@@ -466,10 +492,10 @@ fn extract_enum_fields(
     let candidates: &[usize] = &[32, struct_size - 4, struct_size - 8];
 
     for &off in candidates {
-        let pos = base + off;
-        if pos + 4 > data.len() {
-            continue;
-        }
+        let pos = match base.checked_add(off) {
+            Some(v) if v + 4 <= data.len() => v,
+            _ => continue,
+        };
 
         let enc = data[pos];
         let ldr = data[pos + 1];
@@ -500,14 +526,25 @@ fn read_string_pointer<'a>(
     sp: &StringPointer,
     payload_size: usize,
 ) -> Result<&'a [u8], ExtractError> {
-    let start = payload_base + sp.offset as usize;
-    let end = start + sp.length as usize;
-    if end > data.len() || (sp.offset as usize + sp.length as usize) > payload_size {
-        return Err(ExtractError::StringOutOfBounds {
-            offset: sp.offset,
-            length: sp.length,
-            payload_size,
-        });
+    let oob = || ExtractError::StringOutOfBounds {
+        offset: sp.offset,
+        length: sp.length,
+        payload_size,
+    };
+
+    let sp_end = (sp.offset as usize)
+        .checked_add(sp.length as usize)
+        .ok_or_else(oob)?;
+    if sp_end > payload_size {
+        return Err(oob());
+    }
+
+    let start = payload_base
+        .checked_add(sp.offset as usize)
+        .ok_or_else(oob)?;
+    let end = start.checked_add(sp.length as usize).ok_or_else(oob)?;
+    if end > data.len() {
+        return Err(oob());
     }
     Ok(&data[start..end])
 }
@@ -518,18 +555,23 @@ fn parse_modules(
     offsets: &Offsets,
     struct_size: usize,
 ) -> Result<Vec<Module>, ExtractError> {
-    let mod_array_start = payload_base + offsets.modules_offset as usize;
+    let mod_array_start = checked_offset(payload_base, offsets.modules_offset as usize)?;
     let n_modules = offsets.modules_length as usize / struct_size;
     let payload_size = offsets.byte_count as usize;
     let mut modules = Vec::with_capacity(n_modules);
 
     for i in 0..n_modules {
-        let base = mod_array_start + i * struct_size;
+        let base = mod_array_start
+            .checked_add(i * struct_size)
+            .ok_or(ExtractError::OffsetOverflow)?;
+        if base + 16 > data.len() {
+            return Err(ExtractError::CorruptModuleGraph { index: i });
+        }
 
         let name_sp = StringPointer::from_bytes(&data[base..base + 8])
-            .ok_or(ExtractError::TrailerNotFound)?;
+            .ok_or(ExtractError::CorruptModuleGraph { index: i })?;
         let contents_sp = StringPointer::from_bytes(&data[base + 8..base + 16])
-            .ok_or(ExtractError::TrailerNotFound)?;
+            .ok_or(ExtractError::CorruptModuleGraph { index: i })?;
 
         let name_bytes = read_string_pointer(data, payload_base, &name_sp, payload_size)?;
         let name = std::str::from_utf8(name_bytes)
@@ -542,9 +584,9 @@ fn parse_modules(
             Vec::new()
         };
 
-        let sourcemap = if struct_size >= 24 {
+        let sourcemap = if struct_size >= 24 && base + 24 <= data.len() {
             let sm_sp = StringPointer::from_bytes(&data[base + 16..base + 24])
-                .ok_or(ExtractError::TrailerNotFound)?;
+                .ok_or(ExtractError::CorruptModuleGraph { index: i })?;
             if sm_sp.length > 0 {
                 Some(read_string_pointer(data, payload_base, &sm_sp, payload_size)?.to_vec())
             } else {

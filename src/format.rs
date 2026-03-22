@@ -435,28 +435,28 @@ impl Module {
             };
         }
 
-        let name = self.name.to_lowercase();
-        if name.ends_with(".js") || name.ends_with(".mjs") || name.ends_with(".cjs") {
+        let name = self.name.as_bytes();
+        if name.ends_with(b".js") || name.ends_with(b".mjs") || name.ends_with(b".cjs") {
             "JavaScript"
-        } else if name.ends_with(".ts") || name.ends_with(".mts") || name.ends_with(".cts") {
+        } else if name.ends_with(b".ts") || name.ends_with(b".mts") || name.ends_with(b".cts") {
             "TypeScript"
-        } else if name.ends_with(".json") {
+        } else if name.ends_with(b".json") {
             "JSON"
-        } else if name.ends_with(".wasm") {
+        } else if name.ends_with(b".wasm") {
             "WebAssembly"
-        } else if name.ends_with(".node") {
+        } else if name.ends_with(b".node") {
             "Native addon"
-        } else if name.ends_with(".css") {
+        } else if name.ends_with(b".css") {
             "CSS"
-        } else if name.ends_with(".html") {
+        } else if name.ends_with(b".html") {
             "HTML"
-        } else if name.ends_with(".txt") {
+        } else if name.ends_with(b".txt") {
             "Text"
-        } else if name.ends_with(".toml") {
+        } else if name.ends_with(b".toml") {
             "TOML"
-        } else if name.ends_with(".scm") {
+        } else if name.ends_with(b".scm") {
             "Scheme/Query"
-        } else if name.ends_with(".sql") || name.ends_with(".sqlite") {
+        } else if name.ends_with(b".sql") || name.ends_with(b".sqlite") {
             "SQLite"
         } else {
             "Unknown"

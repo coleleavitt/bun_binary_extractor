@@ -32,4 +32,12 @@ pub enum ExtractError {
 
     #[error("invalid ELF header")]
     InvalidElf,
+
+    #[error("corrupt module graph at module index {index}")]
+    CorruptModuleGraph { index: usize },
+
+    #[error(
+        "integer overflow computing offset (payload_base + offset would exceed address space)"
+    )]
+    OffsetOverflow,
 }

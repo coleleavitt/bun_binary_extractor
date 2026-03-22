@@ -60,7 +60,7 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                 flags.disable_autoload_package_json
             );
         }
-        if let Some(argv) = binary.argv() {
+        if let Some(ref argv) = binary.argv {
             eprintln!("Argv: {argv}");
         }
         eprintln!();
@@ -134,10 +134,9 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         if let Some(ref sourcemap) = module.sourcemap {
-            let sm_path = out_path.with_extension(format!(
-                "{}.map",
-                out_path.extension().and_then(|e| e.to_str()).unwrap_or("")
-            ));
+            let mut sm_name = out_path.as_os_str().to_owned();
+            sm_name.push(".map");
+            let sm_path = PathBuf::from(sm_name);
             fs::write(&sm_path, sourcemap)?;
             if cli.verbose {
                 println!("  Wrote {} ({} bytes)", sm_path.display(), sourcemap.len());
