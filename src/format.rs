@@ -215,15 +215,6 @@ pub enum Encoding {
 }
 
 impl Encoding {
-    pub fn from_u8(val: u8) -> Self {
-        match val {
-            0 => Encoding::Binary,
-            1 => Encoding::Latin1,
-            2 => Encoding::Utf8,
-            other => Encoding::Unknown(other),
-        }
-    }
-
     pub fn as_str(&self) -> &'static str {
         match self {
             Encoding::Binary => "binary",
@@ -231,6 +222,23 @@ impl Encoding {
             Encoding::Utf8 => "utf8",
             Encoding::Unknown(_) => "unknown",
         }
+    }
+}
+
+impl From<u8> for Encoding {
+    fn from(val: u8) -> Self {
+        match val {
+            0 => Encoding::Binary,
+            1 => Encoding::Latin1,
+            2 => Encoding::Utf8,
+            other => Encoding::Unknown(other),
+        }
+    }
+}
+
+impl fmt::Display for Encoding {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -260,31 +268,6 @@ pub enum Loader {
 }
 
 impl Loader {
-    pub fn from_u8(val: u8) -> Self {
-        match val {
-            0 => Loader::Jsx,
-            1 => Loader::Js,
-            2 => Loader::Ts,
-            3 => Loader::Tsx,
-            4 => Loader::Css,
-            5 => Loader::File,
-            6 => Loader::Json,
-            7 => Loader::Jsonc,
-            8 => Loader::Toml,
-            9 => Loader::Wasm,
-            10 => Loader::Napi,
-            11 => Loader::Base64,
-            12 => Loader::DataUrl,
-            13 => Loader::Text,
-            14 => Loader::BunSh,
-            15 => Loader::Sqlite,
-            16 => Loader::SqliteEmbedded,
-            17 => Loader::Html,
-            18 => Loader::Yaml,
-            other => Loader::Unknown(other),
-        }
-    }
-
     pub fn as_str(&self) -> &'static str {
         match self {
             Loader::Jsx => "jsx",
@@ -315,6 +298,39 @@ impl Loader {
     }
 }
 
+impl From<u8> for Loader {
+    fn from(val: u8) -> Self {
+        match val {
+            0 => Loader::Jsx,
+            1 => Loader::Js,
+            2 => Loader::Ts,
+            3 => Loader::Tsx,
+            4 => Loader::Css,
+            5 => Loader::File,
+            6 => Loader::Json,
+            7 => Loader::Jsonc,
+            8 => Loader::Toml,
+            9 => Loader::Wasm,
+            10 => Loader::Napi,
+            11 => Loader::Base64,
+            12 => Loader::DataUrl,
+            13 => Loader::Text,
+            14 => Loader::BunSh,
+            15 => Loader::Sqlite,
+            16 => Loader::SqliteEmbedded,
+            17 => Loader::Html,
+            18 => Loader::Yaml,
+            other => Loader::Unknown(other),
+        }
+    }
+}
+
+impl fmt::Display for Loader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Module format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModuleFormat {
@@ -325,15 +341,6 @@ pub enum ModuleFormat {
 }
 
 impl ModuleFormat {
-    pub fn from_u8(val: u8) -> Self {
-        match val {
-            0 => ModuleFormat::None,
-            1 => ModuleFormat::Esm,
-            2 => ModuleFormat::Cjs,
-            other => ModuleFormat::Unknown(other),
-        }
-    }
-
     pub fn as_str(&self) -> &'static str {
         match self {
             ModuleFormat::None => "none",
@@ -341,6 +348,23 @@ impl ModuleFormat {
             ModuleFormat::Cjs => "cjs",
             ModuleFormat::Unknown(_) => "unknown",
         }
+    }
+}
+
+impl From<u8> for ModuleFormat {
+    fn from(val: u8) -> Self {
+        match val {
+            0 => ModuleFormat::None,
+            1 => ModuleFormat::Esm,
+            2 => ModuleFormat::Cjs,
+            other => ModuleFormat::Unknown(other),
+        }
+    }
+}
+
+impl fmt::Display for ModuleFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -353,20 +377,28 @@ pub enum FileSide {
 }
 
 impl FileSide {
-    pub fn from_u8(val: u8) -> Self {
-        match val {
-            0 => FileSide::Server,
-            1 => FileSide::Client,
-            other => FileSide::Unknown(other),
-        }
-    }
-
     pub fn as_str(&self) -> &'static str {
         match self {
             FileSide::Server => "server",
             FileSide::Client => "client",
             FileSide::Unknown(_) => "unknown",
         }
+    }
+}
+
+impl From<u8> for FileSide {
+    fn from(val: u8) -> Self {
+        match val {
+            0 => FileSide::Server,
+            1 => FileSide::Client,
+            other => FileSide::Unknown(other),
+        }
+    }
+}
+
+impl fmt::Display for FileSide {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 

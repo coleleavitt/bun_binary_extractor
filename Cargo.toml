@@ -2,7 +2,18 @@
 name = "bun_binary_extractor"
 version = "0.1.0"
 edition = "2021"
+description = "Extract embedded JavaScript, WASM, and other files from Bun-compiled single-file executables"
+license = "MIT"
+repository = "https://github.com/coleleavitt/bun_binary_extractor"
+keywords = ["bun", "extractor", "binary", "javascript", "reverse-engineering"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 thiserror = "2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

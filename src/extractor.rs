@@ -142,7 +142,7 @@ fn detect_embed_method(data: &[u8]) -> Result<EmbedMethod, ExtractError> {
             }
         }
 
-        let magic32 = u32::from_le_bytes(data[0..4].try_into().unwrap_or([0; 4]));
+        let magic32 = u32::from_le_bytes(data[0..4].try_into().unwrap());
         if magic32 == 0xFEED_FACF || magic32 == 0xFEED_FACE {
             if let Ok(method) = find_macho_bun_section(data) {
                 return Ok(method);
@@ -226,7 +226,10 @@ fn find_elf_bun_section(data: &[u8]) -> Result<EmbedMethod, ExtractError> {
                 .position(|&b| b == 0)
                 .map(|p| sh_name + p)
                 .unwrap_or(shstrtab.len());
-            let section_name = std::str::from_utf8(&shstrtab[sh_name..name_end]).unwrap_or("");
+            let section_name = match std::str::from_utf8(&shstrtab[sh_name..name_end]) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
 
             if section_name == ".bun" {
                 let sh_offset = u64::from_le_bytes(
@@ -333,21 +336,23 @@ fn find_macho_bun_section(data: &[u8]) -> Result<EmbedMethod, ExtractError> {
             break;
         }
 
-        let cmd = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap_or([0; 4]));
-        let cmdsize =
-            u32::from_le_bytes(data[cursor + 4..cursor + 8].try_into().unwrap_or([0; 4])) as usize;
+        // bounds already checked at loop head: cursor + 8 <= data.len()
+        let cmd = u32::from_le_bytes(data[cursor..cursor + 4].try_into().unwrap());
+        let cmdsize = u32::from_le_bytes(data[cursor + 4..cursor + 8].try_into().unwrap()) as usize;
 
         if cmdsize < 8 || cursor + cmdsize > data.len() {
             break;
         }
 
-        let lc_segment_64: u32 = 0x19;
-        if cmd == lc_segment_64 && cmdsize >= 72 {
+        const LC_SEGMENT_64: u32 = 0x19;
+        if cmd == LC_SEGMENT_64 && cmdsize >= 72 {
             let segname = &data[cursor + 8..cursor + 24];
             if segname.starts_with(b"__BUN\0") {
+                if cursor + 68 > data.len() {
+                    break;
+                }
                 let nsects =
-                    u32::from_le_bytes(data[cursor + 64..cursor + 68].try_into().unwrap_or([0; 4]))
-                        as usize;
+                    u32::from_le_bytes(data[cursor + 64..cursor + 68].try_into().unwrap()) as usize;
 
                 let mut sec_cursor = cursor + 72;
                 for _ in 0..nsects {
@@ -358,9 +363,7 @@ fn find_macho_bun_section(data: &[u8]) -> Result<EmbedMethod, ExtractError> {
                     let sectname = &data[sec_cursor..sec_cursor + 16];
                     if sectname.starts_with(b"__bun\0") {
                         let offset = u32::from_le_bytes(
-                            data[sec_cursor + 48..sec_cursor + 52]
-                                .try_into()
-                                .unwrap_or([0; 4]),
+                            data[sec_cursor + 48..sec_cursor + 52].try_into().unwrap(),
                         ) as usize;
                         return Ok(EmbedMethod::MachoSection {
                             section_offset: offset,
@@ -480,10 +483,10 @@ fn extract_enum_fields(
 
         if enc_valid && ldr_valid && fmt_valid && sid_valid {
             return (
-                Encoding::from_u8(enc),
-                Loader::from_u8(ldr),
-                ModuleFormat::from_u8(fmt),
-                FileSide::from_u8(sid),
+                Encoding::from(enc),
+                Loader::from(ldr),
+                ModuleFormat::from(fmt),
+                FileSide::from(sid),
             );
         }
     }
