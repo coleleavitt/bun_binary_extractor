@@ -21,9 +21,6 @@ pub const PE_MAGIC: &[u8; 2] = b"MZ";
 /// Mach-O 64-bit magic (little-endian).
 pub const MACHO_MAGIC_64: u32 = 0xFEED_FACF;
 
-/// Mach-O FAT magic.
-pub const MACHO_FAT_MAGIC: u32 = 0xCAFE_BABE;
-
 /// Bun section name in PE/ELF binaries.
 pub const BUN_SECTION_NAME: &str = ".bun";
 

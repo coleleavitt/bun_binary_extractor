@@ -17,7 +17,9 @@ pub enum ExtractError {
     #[error("could not auto-detect module struct size (modules_length={modules_length})")]
     ModuleSizeDetectionFailed { modules_length: u32 },
 
-    #[error("string pointer out of bounds: offset={offset}, length={length}, payload_size={payload_size}")]
+    #[error(
+        "string pointer out of bounds: offset={offset}, length={length}, payload_size={payload_size}"
+    )]
     StringOutOfBounds {
         offset: u32,
         length: u32,
@@ -27,17 +29,30 @@ pub enum ExtractError {
     #[error("invalid UTF-8 in module name at index {index}")]
     InvalidModuleName { index: usize },
 
-    #[error("ELF .bun section not found")]
+    #[error(".bun section not found in binary")]
     BunSectionNotFound,
 
-    #[error("invalid ELF header")]
+    #[error("invalid ELF header or structure is corrupt")]
     InvalidElf,
+
+    #[error("invalid PE header or structure is corrupt")]
+    InvalidPe,
+
+    #[error("invalid Mach-O header or structure is corrupt")]
+    InvalidMachO,
 
     #[error("corrupt module graph at module index {index}")]
     CorruptModuleGraph { index: usize },
 
-    #[error(
-        "integer overflow computing offset (payload_base + offset would exceed address space)"
-    )]
+    #[error("integer overflow computing offset (payload_base + offset would exceed address space)")]
     OffsetOverflow,
+
+    #[error("sourcemap parse failed: {reason}")]
+    SourceMapParseFailed { reason: &'static str },
+
+    #[error("zstd decompression failed: {0}")]
+    ZstdDecompressFailed(String),
+
+    #[error("JSON serialization failed: {0}")]
+    JsonSerializeFailed(#[from] serde_json::Error),
 }

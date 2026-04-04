@@ -1,10 +1,9 @@
-use std::fs;
-use std::path::PathBuf;
-use std::process;
-
-use clap::Parser;
+use std::path::{Component, PathBuf};
+use std::{fs, process};
 
 use bun_binary_extractor::extractor::BunBinary;
+use bun_binary_extractor::sourcemap::BunSourceMap;
+use clap::Parser;
 
 #[derive(Parser)]
 #[command(name = "bun_binary_extractor")]
@@ -28,6 +27,10 @@ struct Cli {
     /// List modules without extracting
     #[arg(long)]
     list: bool,
+
+    /// Decode binary sourcemaps to standard JSON format
+    #[arg(long)]
+    decode_sourcemaps: bool,
 }
 
 fn main() {
@@ -116,6 +119,17 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let rel_path = module.relative_path();
+        let rel = std::path::Path::new(rel_path);
+        let has_unsafe_component = rel.components().any(|c| {
+            matches!(
+                c,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        });
+        if has_unsafe_component {
+            eprintln!("  Skipping module with unsafe path: {}", module.name);
+            continue;
+        }
         let out_path = cli.output.join(rel_path);
 
         if let Some(parent) = out_path.parent() {
@@ -137,9 +151,49 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
             let mut sm_name = out_path.as_os_str().to_owned();
             sm_name.push(".map");
             let sm_path = PathBuf::from(sm_name);
-            fs::write(&sm_path, sourcemap)?;
-            if cli.verbose {
-                println!("  Wrote {} ({} bytes)", sm_path.display(), sourcemap.len());
+
+            if cli.decode_sourcemaps {
+                match BunSourceMap::parse(sourcemap) {
+                    Ok(decoded) => {
+                        decoded.write_json(&sm_path)?;
+                        if cli.verbose {
+                            println!(
+                                "  Wrote {} (decoded JSON, {} sources)",
+                                sm_path.display(),
+                                decoded.sources.len()
+                            );
+                        }
+
+                        let sources_dir = out_path.parent().unwrap_or(&cli.output).join("sources");
+                        let written = decoded.write_sources(&sources_dir)?;
+                        if cli.verbose {
+                            println!(
+                                "  Wrote {} source files to {}",
+                                written,
+                                sources_dir.display()
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "  Warning: failed to decode sourcemap for {}: {e}",
+                            module.name
+                        );
+                        fs::write(&sm_path, sourcemap)?;
+                        if cli.verbose {
+                            println!(
+                                "  Wrote {} ({} bytes, raw binary)",
+                                sm_path.display(),
+                                sourcemap.len()
+                            );
+                        }
+                    }
+                }
+            } else {
+                fs::write(&sm_path, sourcemap)?;
+                if cli.verbose {
+                    println!("  Wrote {} ({} bytes)", sm_path.display(), sourcemap.len());
+                }
             }
         }
     }
