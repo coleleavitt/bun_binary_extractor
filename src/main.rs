@@ -4,6 +4,7 @@ use std::{fs, process};
 use bun_binary_extractor::extractor::BunBinary;
 use bun_binary_extractor::sourcemap::BunSourceMap;
 use clap::Parser;
+use regex::Regex;
 
 #[derive(Parser)]
 #[command(name = "bun_binary_extractor")]
@@ -31,18 +32,37 @@ struct Cli {
     /// Decode binary sourcemaps to standard JSON format
     #[arg(long)]
     decode_sourcemaps: bool,
+
+    /// Preserve directory structure from sourcemap paths (default: true when --decode-sourcemaps)
+    #[arg(long, default_value_t = true)]
+    preserve_paths: bool,
+
+    /// Flatten sourcemap sources to basename only (disables --preserve-paths)
+    #[arg(long, conflicts_with = "preserve_paths")]
+    no_preserve_paths: bool,
+
+    /// Regex pattern to filter which sourcemap sources to extract (e.g., "^src/" to exclude node_modules)
+    #[arg(long, value_name = "REGEX")]
+    filter_sources: Option<String>,
 }
 
 fn main() {
     let cli = Cli::parse();
 
-    if let Err(e) = run(&cli) {
+    let filter_regex = cli.filter_sources.as_ref().map(|pattern| {
+        Regex::new(pattern).unwrap_or_else(|e| {
+            eprintln!("Error: invalid regex pattern '{}': {}", pattern, e);
+            process::exit(1);
+        })
+    });
+
+    if let Err(e) = run(&cli, filter_regex.as_ref()) {
         eprintln!("Error: {e}");
         process::exit(1);
     }
 }
 
-fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
+fn run(cli: &Cli, filter_regex: Option<&Regex>) -> Result<(), Box<dyn std::error::Error>> {
     let binary = BunBinary::from_file(&cli.binary_path)?;
 
     if cli.verbose {
@@ -165,7 +185,9 @@ fn run(cli: &Cli) -> Result<(), Box<dyn std::error::Error>> {
                         }
 
                         let sources_dir = out_path.parent().unwrap_or(&cli.output).join("sources");
-                        let written = decoded.write_sources(&sources_dir)?;
+                        let preserve = cli.preserve_paths && !cli.no_preserve_paths;
+                        let written =
+                            decoded.write_sources(&sources_dir, preserve, filter_regex)?;
                         if cli.verbose {
                             println!(
                                 "  Wrote {} source files to {}",

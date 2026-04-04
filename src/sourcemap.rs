@@ -236,34 +236,58 @@ impl BunSourceMap {
 
     /// Write individual source files to a directory.
     ///
-    /// Creates the directory if it doesn't exist.
-    /// Files are written with their original names (basename only).
-    pub fn write_sources(&self, dir: &Path) -> Result<usize, ExtractError> {
+    /// Path sanitization strips leading `../` and `/`, converts `\` to `/`,
+    /// and skips paths with remaining `..` components.
+    pub fn write_sources(
+        &self,
+        dir: &Path,
+        preserve_paths: bool,
+        filter: Option<&regex::Regex>,
+    ) -> Result<usize, ExtractError> {
         fs::create_dir_all(dir)?;
 
         let mut written = 0;
         for (name, content) in self.sources.iter().zip(self.sources_content.iter()) {
-            // Use basename to avoid path traversal
-            let basename = Path::new(name)
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| name.clone());
+            if let Some(re) = filter {
+                if !re.is_match(name) {
+                    continue;
+                }
+            }
 
-            let file_path = dir.join(&basename);
-
-            // Handle potential name collisions by appending index
-            let final_path = if file_path.exists() {
-                let stem = Path::new(&basename)
-                    .file_stem()
+            let relative_path = if preserve_paths {
+                match sanitize_source_path(name) {
+                    Some(p) => p,
+                    None => continue,
+                }
+            } else {
+                Path::new(name)
+                    .file_name()
                     .map(|s| s.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| basename.clone());
-                let ext = Path::new(&basename)
+                    .unwrap_or_else(|| name.clone())
+            };
+
+            let file_path = dir.join(&relative_path);
+
+            if let Some(parent) = file_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+
+            let final_path = if file_path.exists() {
+                let ext = Path::new(&relative_path)
                     .extension()
                     .map(|s| format!(".{}", s.to_string_lossy()))
                     .unwrap_or_default();
+
+                let parent = file_path.parent().unwrap_or(dir);
+                let basename_stem = Path::new(&relative_path)
+                    .file_name()
+                    .and_then(|f| Path::new(f).file_stem())
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| relative_path.clone());
+
                 let mut idx = 1;
                 loop {
-                    let candidate = dir.join(format!("{stem}_{idx}{ext}"));
+                    let candidate = parent.join(format!("{basename_stem}_{idx}{ext}"));
                     if !candidate.exists() {
                         break candidate;
                     }
@@ -280,6 +304,36 @@ impl BunSourceMap {
 
         Ok(written)
     }
+}
+
+/// Sanitize a sourcemap path: strip leading `../` and `/`, reject remaining `..` components.
+fn sanitize_source_path(path: &str) -> Option<String> {
+    let normalized = path.replace('\\', "/");
+    let mut result = normalized.as_str();
+
+    while result.starts_with('/') {
+        result = &result[1..];
+    }
+
+    while result.starts_with("../") {
+        result = &result[3..];
+    }
+
+    if result == ".." {
+        return None;
+    }
+
+    for component in result.split('/') {
+        if component == ".." {
+            return None;
+        }
+    }
+
+    if result.is_empty() {
+        return None;
+    }
+
+    Some(result.to_string())
 }
 
 #[cfg(test)]
