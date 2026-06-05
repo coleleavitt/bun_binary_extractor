@@ -42,3 +42,26 @@ This does not recover anything extra from third-party release binaries, but it g
 ## Bytecode
 
 `--extract-bytecode` writes Bun/JSC bytecode blobs as raw `.bytecode` files. The executable still embeds the generated JavaScript contents separately, so source recovery does not require bytecode disassembly. Interpreting or decompiling JSC bytecode is intentionally out of scope for this extractor.
+
+## Sourcemap Source Provenance
+
+`--decode-sourcemaps` writes each decoded sourcemap as standard JSON and expands its `sourcesContent` entries into a sibling `sources/` directory. These files are whatever Bun embedded in the sourcemap; they are not guaranteed to be pristine authoring sources.
+
+Some build pipelines put post-transform code in `sourcesContent`. For example, a `.tsx` source may contain Solid/OpenTUI helper symbols such as `_$insert`, `_$createComponent`, or `_$memo` if the sourcemap was generated after JSX compilation.
+
+For OpenTUI/Solid universal JSX output, the extractor now writes best-effort recovered TSX into a sibling `sources-recovered/` directory. This is a readability aid, not a lossless inverse compiler. It keeps the raw `sources/` file as the authoritative artifact and records recovery metadata in the manifest. Pass `--no-decompile-sources` to skip recovered-source sidecars.
+
+To make this explicit, each `sources/` directory also gets a `source-manifest.json` file. The manifest records:
+
+- original sourcemap source path
+- sanitized output path
+- content byte length
+- FNV-1a content hash
+- `provenance: "sourcemap.sourcesContent"`
+- `likely_transformed`
+- transform-signal reasons when obvious compiler or bundler helper patterns are present
+- optional recovered source output under `sources-recovered/`
+- recovery warnings when a transformed construct could not be converted cleanly
+- skipped entries, such as filtered or unsafe paths
+
+Treat `likely_transformed` as a triage signal, not proof. The authoritative fact is that the recovered file came from sourcemap `sourcesContent`.

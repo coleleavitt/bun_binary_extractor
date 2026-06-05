@@ -51,6 +51,10 @@ struct Cli {
     #[arg(long, value_name = "REGEX")]
     filter_sources: Option<String>,
 
+    /// Do not write best-effort recovered JSX/TSX for transformed sourcemap sources
+    #[arg(long)]
+    no_decompile_sources: bool,
+
     /// Extract bytecode blobs (Bun precompiled bytecode, can be 100MB+)
     #[arg(long)]
     extract_bytecode: bool,
@@ -208,14 +212,33 @@ fn run(cli: &Cli, filter_regex: Option<&Regex>) -> Result<(), Box<dyn std::error
 
                         let sources_dir = out_path.parent().unwrap_or(&cli.output).join("sources");
                         let preserve = cli.preserve_paths && !cli.no_preserve_paths;
-                        let written =
-                            decoded.write_sources(&sources_dir, preserve, filter_regex)?;
+                        let source_report = decoded.write_sources_with_manifest(
+                            &sources_dir,
+                            preserve,
+                            filter_regex,
+                            !cli.no_decompile_sources,
+                        )?;
                         if cli.verbose {
                             println!(
                                 "  Wrote {} source files to {}",
-                                written,
+                                source_report.written,
                                 sources_dir.display()
                             );
+                            println!(
+                                "  Wrote source manifest to {}",
+                                source_report.manifest_path.display()
+                            );
+                            if source_report.recovered > 0 {
+                                println!(
+                                    "  Wrote {} recovered source files to {}",
+                                    source_report.recovered,
+                                    source_report
+                                        .recovered_dir
+                                        .as_ref()
+                                        .map(|path| path.display().to_string())
+                                        .unwrap_or_else(|| "<none>".to_string())
+                                );
+                            }
                         }
                     }
                     Err(e) => {

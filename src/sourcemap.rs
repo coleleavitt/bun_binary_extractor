@@ -5,8 +5,9 @@
 
 use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use crate::decompile::decompile_source;
 use crate::error::ExtractError;
 use crate::format::{BUNFS_PREFIX_WIN_PUBLIC, MODULE_NAME_PREFIX, StringPointer};
 
@@ -505,6 +506,14 @@ pub struct BunSourceMap {
     pub mappings: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct SourceWriteReport {
+    pub written: usize,
+    pub manifest_path: PathBuf,
+    pub recovered: usize,
+    pub recovered_dir: Option<PathBuf>,
+}
+
 impl BunSourceMap {
     /// Parse a Bun binary sourcemap blob.
     ///
@@ -711,12 +720,40 @@ impl BunSourceMap {
         preserve_paths: bool,
         filter: Option<&regex::Regex>,
     ) -> Result<usize, ExtractError> {
+        Ok(self
+            .write_sources_with_manifest(dir, preserve_paths, filter, false)?
+            .written)
+    }
+
+    /// Write individual source files plus a provenance manifest.
+    ///
+    /// The manifest records that files came from sourcemap `sourcesContent`.
+    /// This matters because some tools put post-transform source into
+    /// `sourcesContent`, so recovered files are not always pristine author
+    /// sources.
+    pub fn write_sources_with_manifest(
+        &self,
+        dir: &Path,
+        preserve_paths: bool,
+        filter: Option<&regex::Regex>,
+        recover_transformed: bool,
+    ) -> Result<SourceWriteReport, ExtractError> {
         fs::create_dir_all(dir)?;
 
         let mut written = 0;
+        let mut recovered = 0;
+        let recovered_dir =
+            recover_transformed.then(|| dir.parent().unwrap_or(dir).join("sources-recovered"));
+        let mut entries = Vec::new();
         for (name, content) in self.sources.iter().zip(self.sources_content.iter()) {
             if let Some(re) = filter {
                 if !re.is_match(name) {
+                    entries.push(serde_json::json!({
+                        "source": name,
+                        "status": "skipped",
+                        "reason": "filtered",
+                        "provenance": "sourcemap.sourcesContent"
+                    }));
                     continue;
                 }
             }
@@ -724,7 +761,15 @@ impl BunSourceMap {
             let relative_path = if preserve_paths {
                 match sanitize_source_path(name) {
                     Some(p) => p,
-                    None => continue,
+                    None => {
+                        entries.push(serde_json::json!({
+                            "source": name,
+                            "status": "skipped",
+                            "reason": "unsafe-path",
+                            "provenance": "sourcemap.sourcesContent"
+                        }));
+                        continue;
+                    }
                 }
             } else {
                 Path::new(name)
@@ -739,6 +784,7 @@ impl BunSourceMap {
                 fs::create_dir_all(parent)?;
             }
 
+            let collision_renamed = file_path.exists();
             let final_path = if file_path.exists() {
                 let ext = Path::new(&relative_path)
                     .extension()
@@ -767,10 +813,126 @@ impl BunSourceMap {
             let mut file = fs::File::create(&final_path)?;
             file.write_all(content.as_bytes())?;
             written += 1;
+
+            let output = final_path
+                .strip_prefix(dir)
+                .unwrap_or(final_path.as_path())
+                .to_string_lossy()
+                .replace('\\', "/");
+            let transform_reasons = source_transform_signals(name, content);
+            let recovered_info = if recover_transformed {
+                decompile_source(name, content)
+                    .map(|decompiled| -> Result<serde_json::Value, ExtractError> {
+                        let Some(recovered_base) = recovered_dir.as_ref() else {
+                            return Ok(serde_json::Value::Null);
+                        };
+                        let recovered_path = recovered_base.join(&relative_path);
+                        if let Some(parent) = recovered_path.parent() {
+                            fs::create_dir_all(parent)?;
+                        }
+                        fs::write(&recovered_path, decompiled.content.as_bytes())?;
+                        recovered += 1;
+                        let recovered_output = recovered_path
+                            .strip_prefix(recovered_base)
+                            .unwrap_or(recovered_path.as_path())
+                            .to_string_lossy()
+                            .replace('\\', "/");
+                        Ok(serde_json::json!({
+                            "kind": decompiled.kind,
+                            "output": recovered_output,
+                            "warnings": decompiled.warnings
+                        }))
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
+
+            let mut entry = serde_json::json!({
+                "source": name,
+                "status": "written",
+                "output": output,
+                "content_bytes": content.len(),
+                "content_hash_fnv1a64": format!("{:016x}", fnv1a64(content.as_bytes())),
+                "provenance": "sourcemap.sourcesContent",
+                "likely_transformed": !transform_reasons.is_empty(),
+                "transform_reasons": transform_reasons,
+                "collision_renamed": collision_renamed
+            });
+            if let Some(recovered_info) = recovered_info {
+                entry["recovered"] = recovered_info;
+            }
+            entries.push(entry);
         }
 
-        Ok(written)
+        let manifest_path = dir.join("source-manifest.json");
+        let manifest = serde_json::json!({
+            "format": "bun_binary_extractor.source_manifest.v1",
+            "note": "Recovered files are copied from sourcemap sourcesContent. They may be transformed/generated if that is what Bun embedded.",
+            "source_count": self.sources.len(),
+            "sources_content_count": self.sources_content.len(),
+            "written": written,
+            "recovered": recovered,
+            "recovered_dir": recovered_dir.as_ref().map(|path| path.to_string_lossy()),
+            "entries": entries
+        });
+        fs::write(&manifest_path, serde_json::to_string_pretty(&manifest)?)?;
+
+        Ok(SourceWriteReport {
+            written,
+            manifest_path,
+            recovered,
+            recovered_dir,
+        })
     }
+}
+
+pub fn source_transform_signals(_source_name: &str, content: &str) -> Vec<&'static str> {
+    let mut reasons = Vec::new();
+
+    if (content.contains("@opentui/solid") || content.contains("solid-js/web"))
+        && (content.contains("_$createComponent")
+            || content.contains("_$insert")
+            || content.contains("_$memo")
+            || content.contains("_$template"))
+    {
+        reasons.push("compiled JSX/Solid helper symbols");
+    }
+
+    if content.contains("react/jsx-runtime")
+        && (content.contains("_jsx") || content.contains("jsxDEV"))
+    {
+        reasons.push("compiled React JSX runtime");
+    }
+
+    if content.contains("__commonJS")
+        || content.contains("__toESM")
+        || content.contains("var __defProp")
+    {
+        reasons.push("bundler helper symbols");
+    }
+
+    if content.contains("Object.defineProperty(exports, \"__esModule\"") {
+        reasons.push("CommonJS transpilation marker");
+    }
+
+    if content.contains("sourceMappingURL=") {
+        reasons.push("nested sourceMappingURL comment");
+    }
+
+    reasons
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x00000100000001b3;
+
+    let mut hash = OFFSET;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
 }
 
 /// Sanitize a sourcemap path: strip Bun virtual roots, strip leading `../` and `/`
@@ -874,5 +1036,14 @@ mod tests {
             sanitize_source_path("/tmp/out.js"),
             Some("tmp/out.js".to_string())
         );
+    }
+
+    #[test]
+    fn source_transform_signals_detects_compiled_solid_output() {
+        let content = r#"import { memo as _$memo } from "@opentui/solid";
+const view = _$createComponent(Foo, {});
+"#;
+        let reasons = source_transform_signals("src/view.tsx", content);
+        assert!(reasons.contains(&"compiled JSX/Solid helper symbols"));
     }
 }
