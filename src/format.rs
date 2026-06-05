@@ -9,6 +9,9 @@ pub const BUNFS_PREFIX_UNIX: &str = "/$bunfs/root/";
 /// Virtual path prefix on Windows systems.
 pub const BUNFS_PREFIX_WIN: &str = "B:\\~BUN\\";
 
+/// Public virtual path prefix Bun writes into Windows-target standalone graphs.
+pub const BUNFS_PREFIX_WIN_PUBLIC: &str = "B:/~BUN/";
+
 /// Module name prefix used to validate struct size detection.
 pub const MODULE_NAME_PREFIX: &str = "/$bunfs/";
 
@@ -261,6 +264,8 @@ pub enum Loader {
     SqliteEmbedded,
     Html,
     Yaml,
+    Json5,
+    Md,
     Unknown(u8),
 }
 
@@ -286,6 +291,8 @@ impl Loader {
             Loader::SqliteEmbedded => "sqlite_embedded",
             Loader::Html => "html",
             Loader::Yaml => "yaml",
+            Loader::Json5 => "json5",
+            Loader::Md => "md",
             Loader::Unknown(_) => "unknown",
         }
     }
@@ -317,6 +324,8 @@ impl From<u8> for Loader {
             16 => Loader::SqliteEmbedded,
             17 => Loader::Html,
             18 => Loader::Yaml,
+            19 => Loader::Json5,
+            20 => Loader::Md,
             other => Loader::Unknown(other),
         }
     }
@@ -406,6 +415,14 @@ pub struct Module {
     pub name: String,
     pub contents: Vec<u8>,
     pub sourcemap: Option<Vec<u8>>,
+    /// Precompiled Bun bytecode (Bun 1.2+ with `--bytecode` or default in compiled binaries).
+    /// This is Bun's internal IR — much larger than the source but loads instantly at runtime.
+    pub bytecode: Option<Vec<u8>>,
+    /// Module metadata blob (currently unused by Anthropic's builds but reserved in the struct).
+    pub module_info: Option<Vec<u8>>,
+    /// The virtual path used when generating bytecode (e.g., `/$bunfs/root/src/entrypoints/cli.js`).
+    /// Must match at runtime for bytecode cache hits.
+    pub bytecode_origin_path: Option<String>,
     pub encoding: Encoding,
     pub loader: Loader,
     pub module_format: ModuleFormat,
@@ -418,7 +435,9 @@ impl Module {
     pub fn relative_path(&self) -> &str {
         self.name
             .strip_prefix(BUNFS_PREFIX_UNIX)
+            .or_else(|| self.name.strip_prefix("B:/~BUN/root/"))
             .or_else(|| self.name.strip_prefix(BUNFS_PREFIX_WIN))
+            .or_else(|| self.name.strip_prefix(BUNFS_PREFIX_WIN_PUBLIC))
             .or_else(|| self.name.strip_prefix("/$bunfs/"))
             .unwrap_or(&self.name)
     }
@@ -439,6 +458,8 @@ impl Module {
             "TypeScript"
         } else if name.ends_with(b".json") {
             "JSON"
+        } else if name.ends_with(b".json5") {
+            "JSON5"
         } else if name.ends_with(b".wasm") {
             "WebAssembly"
         } else if name.ends_with(b".node") {
@@ -455,6 +476,8 @@ impl Module {
             "Scheme/Query"
         } else if name.ends_with(b".sql") || name.ends_with(b".sqlite") {
             "SQLite"
+        } else if name.ends_with(b".md") || name.ends_with(b".markdown") {
+            "Markdown"
         } else {
             "Unknown"
         }

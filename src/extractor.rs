@@ -4,6 +4,8 @@ use std::path::Path;
 use crate::error::ExtractError;
 use crate::format::{
     BUN_SECTION_NAME,
+    BUNFS_PREFIX_WIN,
+    BUNFS_PREFIX_WIN_PUBLIC,
     BunVersion,
     CANDIDATE_STRUCT_SIZES,
     ELF_MAGIC,
@@ -569,7 +571,7 @@ fn detect_module_struct_size(
                 }
             };
 
-            if !name.starts_with(MODULE_NAME_PREFIX) {
+            if !is_standalone_module_name(name) {
                 all_valid = false;
                 break;
             }
@@ -581,6 +583,12 @@ fn detect_module_struct_size(
     }
 
     Err(ExtractError::ModuleSizeDetectionFailed { modules_length })
+}
+
+fn is_standalone_module_name(name: &str) -> bool {
+    name.starts_with(MODULE_NAME_PREFIX)
+        || name.starts_with(BUNFS_PREFIX_WIN_PUBLIC)
+        || name.starts_with(BUNFS_PREFIX_WIN)
 }
 
 fn extract_enum_fields(
@@ -599,14 +607,18 @@ fn extract_enum_fields(
         return defaults;
     }
 
-    // v1.3.2 has 4 StringPointers (32 bytes), then 4 enum u8s at offset 32.
-    // But Zig may pad the struct. Try known positions:
-    //   - offset 32: right after 4 SPs (Bun <=1.3 Zig-padded layout)
-    //   - struct_size - 4: last 4 bytes (packed layouts like 36-byte or 52-byte)
-    //   - struct_size - 8: for structs where enums have 4 bytes padding after them
-    let candidates: &[usize] = &[32, struct_size - 4, struct_size - 8];
+    let mut candidates = Vec::with_capacity(4);
+    if struct_size >= 52 {
+        // Modern records have 6 StringPointers (48 bytes), then 4 enum bytes.
+        // Offset 32 is module_info and may be all zero, so trying it first
+        // silently misclassifies modern modules as binary JSX.
+        candidates.extend_from_slice(&[48, struct_size - 4, struct_size - 8]);
+    } else {
+        // Legacy records have 4 StringPointers (32 bytes), then enum bytes.
+        candidates.extend_from_slice(&[32, struct_size - 4, struct_size - 8]);
+    }
 
-    for &off in candidates {
+    for off in candidates {
         let pos = match base.checked_add(off) {
             Some(v) if v.checked_add(4).is_some_and(|end| end <= data.len()) => v,
             _ => continue,
@@ -619,7 +631,7 @@ fn extract_enum_fields(
         let sid = enum_bytes[3];
 
         let enc_valid = enc <= 2;
-        let ldr_valid = ldr <= 18;
+        let ldr_valid = ldr <= 20;
         let fmt_valid = fmt <= 2;
         let sid_valid = sid <= 1;
 
@@ -710,6 +722,7 @@ fn parse_modules(
             Vec::new()
         };
 
+        // StringPointer 3: sourcemap (offset 16..24)
         let base_24 = base.checked_add(24);
         let sourcemap = if struct_size >= 24 && base_24.is_some_and(|v| v <= data.len()) {
             let sm_end = base_24.ok_or(ExtractError::CorruptModuleGraph { index: i })?;
@@ -724,6 +737,78 @@ fn parse_modules(
             None
         };
 
+        // StringPointer 4: bytecode (offset 24..32) — Bun 1.2+ precompiled bytecode
+        let bytecode = if struct_size >= 32 {
+            let sp_start = base
+                .checked_add(24)
+                .ok_or(ExtractError::CorruptModuleGraph { index: i })?;
+            let sp_end = base
+                .checked_add(32)
+                .ok_or(ExtractError::CorruptModuleGraph { index: i })?;
+            if sp_end <= data.len() {
+                let sp = StringPointer::from_bytes(&data[sp_start..sp_end])
+                    .ok_or(ExtractError::CorruptModuleGraph { index: i })?;
+                if sp.length > 0 {
+                    Some(read_string_pointer(data, payload_base, &sp, payload_size)?.to_vec())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // StringPointer 5: module_info (offset 32..40) — metadata blob.
+        // This exists only in the 6-StringPointer layout; old padded records
+        // have enum bytes around this offset.
+        let module_info = if struct_size >= 52 {
+            let sp_start = base
+                .checked_add(32)
+                .ok_or(ExtractError::CorruptModuleGraph { index: i })?;
+            let sp_end = base
+                .checked_add(40)
+                .ok_or(ExtractError::CorruptModuleGraph { index: i })?;
+            if sp_end <= data.len() {
+                let sp = StringPointer::from_bytes(&data[sp_start..sp_end])
+                    .ok_or(ExtractError::CorruptModuleGraph { index: i })?;
+                if sp.length > 0 {
+                    Some(read_string_pointer(data, payload_base, &sp, payload_size)?.to_vec())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // StringPointer 6: bytecode_origin_path (offset 40..48) — path used for bytecode cache key.
+        let bytecode_origin_path = if struct_size >= 52 {
+            let sp_start = base
+                .checked_add(40)
+                .ok_or(ExtractError::CorruptModuleGraph { index: i })?;
+            let sp_end = base
+                .checked_add(48)
+                .ok_or(ExtractError::CorruptModuleGraph { index: i })?;
+            if sp_end <= data.len() {
+                let sp = StringPointer::from_bytes(&data[sp_start..sp_end])
+                    .ok_or(ExtractError::CorruptModuleGraph { index: i })?;
+                if sp.length > 0 {
+                    let path_bytes = read_string_pointer(data, payload_base, &sp, payload_size)?;
+                    Some(std::str::from_utf8(path_bytes).unwrap_or("").to_string())
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let (encoding, loader, module_format, side) = extract_enum_fields(data, base, struct_size);
 
         modules.push(Module {
@@ -731,6 +816,9 @@ fn parse_modules(
             name,
             contents,
             sourcemap,
+            bytecode,
+            module_info,
+            bytecode_origin_path,
             encoding,
             loader,
             module_format,
@@ -740,4 +828,404 @@ fn parse_modules(
     }
 
     Ok(modules)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::format::{BUN_SECTION_NAME, TRAILER};
+
+    const ENC_BINARY: u8 = 0;
+    const ENC_LATIN1: u8 = 1;
+    const LOADER_JSX: u8 = 0;
+    const LOADER_JS: u8 = 1;
+    const LOADER_JSON5: u8 = 19;
+    const LOADER_MD: u8 = 20;
+    const FORMAT_NONE: u8 = 0;
+    const FORMAT_ESM: u8 = 1;
+    const FORMAT_CJS: u8 = 2;
+    const SIDE_SERVER: u8 = 0;
+    const SIDE_CLIENT: u8 = 1;
+
+    #[derive(Clone, Copy)]
+    struct EnumBytes {
+        encoding: u8,
+        loader: u8,
+        module_format: u8,
+        side: u8,
+    }
+
+    #[derive(Default)]
+    struct BuiltGraph {
+        payload: Vec<u8>,
+        offsets: Vec<u8>,
+    }
+
+    fn append_blob(payload: &mut Vec<u8>, bytes: &[u8]) -> StringPointer {
+        let offset = payload.len();
+        payload.extend_from_slice(bytes);
+        StringPointer {
+            offset: offset as u32,
+            length: bytes.len() as u32,
+        }
+    }
+
+    fn push_u32(out: &mut Vec<u8>, value: u32) {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_u64(out: &mut Vec<u8>, value: u64) {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn put_sp(record: &mut [u8], offset: usize, sp: StringPointer) {
+        record[offset..offset + 4].copy_from_slice(&sp.offset.to_le_bytes());
+        record[offset + 4..offset + 8].copy_from_slice(&sp.length.to_le_bytes());
+    }
+
+    fn legacy_record(name: StringPointer, contents: StringPointer, enums: EnumBytes) -> Vec<u8> {
+        let mut record = vec![0; 36];
+        put_sp(&mut record, 0, name);
+        put_sp(&mut record, 8, contents);
+        record[32] = enums.encoding;
+        record[33] = enums.loader;
+        record[34] = enums.module_format;
+        record[35] = enums.side;
+        record
+    }
+
+    fn modern_record(
+        name: StringPointer,
+        contents: StringPointer,
+        bytecode: StringPointer,
+        module_info: StringPointer,
+        bytecode_origin_path: StringPointer,
+        enums: EnumBytes,
+    ) -> Vec<u8> {
+        let mut record = vec![0; 52];
+        put_sp(&mut record, 0, name);
+        put_sp(&mut record, 8, contents);
+        put_sp(&mut record, 24, bytecode);
+        put_sp(&mut record, 32, module_info);
+        put_sp(&mut record, 40, bytecode_origin_path);
+        record[48] = enums.encoding;
+        record[49] = enums.loader;
+        record[50] = enums.module_format;
+        record[51] = enums.side;
+        record
+    }
+
+    fn build_graph(mut payload: Vec<u8>, records: Vec<Vec<u8>>) -> BuiltGraph {
+        let modules_offset = payload.len() as u32;
+        let modules_length = records.iter().map(Vec::len).sum::<usize>() as u32;
+        for record in records {
+            payload.extend_from_slice(&record);
+        }
+        let argv = b"--fixture";
+        let argv_offset = payload.len() as u32;
+        payload.extend_from_slice(argv);
+
+        let mut offsets = Vec::with_capacity(OFFSETS_SIZE);
+        push_u64(&mut offsets, payload.len() as u64);
+        push_u32(&mut offsets, modules_offset);
+        push_u32(&mut offsets, modules_length);
+        push_u32(&mut offsets, 0);
+        push_u32(&mut offsets, argv_offset);
+        push_u32(&mut offsets, argv.len() as u32);
+        push_u32(&mut offsets, 0);
+        assert_eq!(offsets.len(), OFFSETS_SIZE);
+
+        BuiltGraph { payload, offsets }
+    }
+
+    fn graph_bytes(graph: &BuiltGraph) -> Vec<u8> {
+        let mut bytes = graph.payload.clone();
+        bytes.extend_from_slice(&graph.offsets);
+        bytes.extend_from_slice(TRAILER);
+        bytes
+    }
+
+    fn appended_binary(graph: &BuiltGraph) -> Vec<u8> {
+        let mut binary = b"not-an-elf".to_vec();
+        binary.extend_from_slice(&graph.payload);
+        binary.extend_from_slice(&graph.offsets);
+        binary.extend_from_slice(TRAILER);
+        push_u64(
+            &mut binary,
+            (graph.payload.len() + graph.offsets.len() + TRAILER.len()) as u64,
+        );
+        binary
+    }
+
+    fn section_blob(graph: &BuiltGraph) -> Vec<u8> {
+        let graph_bytes = graph_bytes(graph);
+        let mut section = Vec::with_capacity(8 + graph_bytes.len());
+        push_u64(&mut section, graph_bytes.len() as u64);
+        section.extend_from_slice(&graph_bytes);
+        section
+    }
+
+    fn minimal_pe_with_bun_section(graph: &BuiltGraph) -> Vec<u8> {
+        let section = section_blob(graph);
+        let pe_offset = 0x80usize;
+        let section_table = pe_offset + 24;
+        let section_offset = 0x200usize;
+        let mut binary = vec![0; section_offset + section.len()];
+        binary[0..2].copy_from_slice(b"MZ");
+        binary[0x3c..0x40].copy_from_slice(&(pe_offset as u32).to_le_bytes());
+        binary[pe_offset..pe_offset + 4].copy_from_slice(b"PE\0\0");
+        binary[pe_offset + 6..pe_offset + 8].copy_from_slice(&1u16.to_le_bytes());
+        binary[pe_offset + 20..pe_offset + 22].copy_from_slice(&0u16.to_le_bytes());
+        binary[section_table..section_table + BUN_SECTION_NAME.len()]
+            .copy_from_slice(BUN_SECTION_NAME.as_bytes());
+        binary[section_table + 16..section_table + 20]
+            .copy_from_slice(&(section.len() as u32).to_le_bytes());
+        binary[section_table + 20..section_table + 24]
+            .copy_from_slice(&(section_offset as u32).to_le_bytes());
+        binary[section_offset..section_offset + section.len()].copy_from_slice(&section);
+        binary
+    }
+
+    fn minimal_elf_with_bun_section(graph: &BuiltGraph) -> Vec<u8> {
+        let section = section_blob(graph);
+        let shstrtab = b"\0.shstrtab\0.bun\0";
+        let shstrtab_offset = 0x80usize;
+        let shoff = 0x100usize;
+        let section_offset = 0x300usize;
+        let mut binary = vec![0; section_offset + section.len()];
+        binary[0..4].copy_from_slice(ELF_MAGIC);
+        binary[4] = 2;
+        binary[40..48].copy_from_slice(&(shoff as u64).to_le_bytes());
+        binary[58..60].copy_from_slice(&64u16.to_le_bytes());
+        binary[60..62].copy_from_slice(&3u16.to_le_bytes());
+        binary[62..64].copy_from_slice(&1u16.to_le_bytes());
+        binary[shstrtab_offset..shstrtab_offset + shstrtab.len()].copy_from_slice(shstrtab);
+
+        let shstrtab_header = shoff + 64;
+        binary[shstrtab_header..shstrtab_header + 4].copy_from_slice(&1u32.to_le_bytes());
+        binary[shstrtab_header + 24..shstrtab_header + 32]
+            .copy_from_slice(&(shstrtab_offset as u64).to_le_bytes());
+        binary[shstrtab_header + 32..shstrtab_header + 40]
+            .copy_from_slice(&(shstrtab.len() as u64).to_le_bytes());
+
+        let bun_header = shoff + 128;
+        binary[bun_header..bun_header + 4].copy_from_slice(&11u32.to_le_bytes());
+        binary[bun_header + 24..bun_header + 32]
+            .copy_from_slice(&(section_offset as u64).to_le_bytes());
+        binary[bun_header + 32..bun_header + 40]
+            .copy_from_slice(&(section.len() as u64).to_le_bytes());
+        binary[section_offset..section_offset + section.len()].copy_from_slice(&section);
+        binary
+    }
+
+    fn minimal_macho_with_bun_section(graph: &BuiltGraph) -> Vec<u8> {
+        let section = section_blob(graph);
+        let section_offset = 0x200usize;
+        let segment_offset = 32usize;
+        let section_header = segment_offset + 72;
+        let mut binary = vec![0; section_offset + section.len()];
+        binary[0..4].copy_from_slice(&MACHO_MAGIC_64.to_le_bytes());
+        binary[16..20].copy_from_slice(&1u32.to_le_bytes());
+        binary[segment_offset..segment_offset + 4].copy_from_slice(&0x19u32.to_le_bytes());
+        binary[segment_offset + 4..segment_offset + 8].copy_from_slice(&152u32.to_le_bytes());
+        binary[segment_offset + 8..segment_offset + 24].copy_from_slice(MACHO_SEGMENT_NAME);
+        binary[segment_offset + 64..segment_offset + 68].copy_from_slice(&1u32.to_le_bytes());
+        binary[section_header..section_header + 16].copy_from_slice(MACHO_SECTION_NAME);
+        binary[section_header + 48..section_header + 52]
+            .copy_from_slice(&(section_offset as u32).to_le_bytes());
+        binary[section_offset..section_offset + section.len()].copy_from_slice(&section);
+        binary
+    }
+
+    fn modern_graph_with_two_modules() -> BuiltGraph {
+        let mut payload = Vec::new();
+        let name0 = append_blob(&mut payload, b"/$bunfs/root/readme.md");
+        let contents0 = append_blob(&mut payload, b"# readme\n");
+        let bytecode0 = append_blob(&mut payload, b"bytecode-0");
+
+        let name1 = append_blob(&mut payload, b"/$bunfs/root/config.json5");
+        let contents1 = append_blob(&mut payload, b"{answer: 42}\n");
+        let bytecode1 = append_blob(&mut payload, b"bytecode-1");
+        let module_info1 = append_blob(&mut payload, b"module-info-1");
+        let origin1 = append_blob(&mut payload, b"/$bunfs/root/config.json5");
+
+        build_graph(
+            payload,
+            vec![
+                modern_record(
+                    name0,
+                    contents0,
+                    bytecode0,
+                    StringPointer {
+                        offset: 0,
+                        length: 0,
+                    },
+                    StringPointer {
+                        offset: 0,
+                        length: 0,
+                    },
+                    EnumBytes {
+                        encoding: ENC_LATIN1,
+                        loader: LOADER_MD,
+                        module_format: FORMAT_ESM,
+                        side: SIDE_CLIENT,
+                    },
+                ),
+                modern_record(
+                    name1,
+                    contents1,
+                    bytecode1,
+                    module_info1,
+                    origin1,
+                    EnumBytes {
+                        encoding: ENC_LATIN1,
+                        loader: LOADER_JSON5,
+                        module_format: FORMAT_ESM,
+                        side: SIDE_SERVER,
+                    },
+                ),
+            ],
+        )
+    }
+
+    #[test]
+    fn parses_legacy_appended_layout() {
+        let mut payload = Vec::new();
+        let name = append_blob(&mut payload, b"/$bunfs/root/legacy.js");
+        let contents = append_blob(&mut payload, b"console.log('legacy');\n");
+        let graph = build_graph(
+            payload,
+            vec![legacy_record(
+                name,
+                contents,
+                EnumBytes {
+                    encoding: ENC_LATIN1,
+                    loader: LOADER_JS,
+                    module_format: FORMAT_CJS,
+                    side: SIDE_SERVER,
+                },
+            )],
+        );
+
+        let parsed = BunBinary::parse(&appended_binary(&graph)).unwrap();
+        assert_eq!(parsed.embed_method, EmbedMethod::Appended);
+        assert_eq!(parsed.module_struct_size, 36);
+        assert_eq!(parsed.version, BunVersion::V1_0_1_1);
+        assert_eq!(parsed.argv.as_deref(), Some("--fixture"));
+        assert_eq!(parsed.modules[0].loader, Loader::Js);
+        assert_eq!(parsed.modules[0].encoding, Encoding::Latin1);
+        assert_eq!(parsed.modules[0].module_format, ModuleFormat::Cjs);
+        assert_eq!(parsed.modules[0].bytecode, None);
+        assert_eq!(parsed.modules[0].module_info, None);
+    }
+
+    #[test]
+    fn parses_modern_layout_without_reading_module_info_as_enums() {
+        let graph = modern_graph_with_two_modules();
+        let parsed = BunBinary::parse(&appended_binary(&graph)).unwrap();
+
+        assert_eq!(parsed.module_struct_size, 52);
+        assert_eq!(parsed.version, BunVersion::V1_2_1_3);
+        assert_eq!(parsed.modules.len(), 2);
+
+        let md = &parsed.modules[0];
+        assert_eq!(md.loader, Loader::Md);
+        assert_eq!(md.encoding, Encoding::Latin1);
+        assert_eq!(md.module_format, ModuleFormat::Esm);
+        assert_eq!(md.side, FileSide::Client);
+        assert_eq!(md.bytecode.as_deref(), Some(b"bytecode-0".as_slice()));
+        assert_eq!(md.module_info, None);
+
+        let json5 = &parsed.modules[1];
+        assert_eq!(json5.loader, Loader::Json5);
+        assert_eq!(json5.bytecode.as_deref(), Some(b"bytecode-1".as_slice()));
+        assert_eq!(
+            json5.module_info.as_deref(),
+            Some(b"module-info-1".as_slice())
+        );
+        assert_eq!(
+            json5.bytecode_origin_path.as_deref(),
+            Some("/$bunfs/root/config.json5")
+        );
+    }
+
+    #[test]
+    fn detects_windows_virtual_module_names() {
+        let mut payload = Vec::new();
+        let name = append_blob(&mut payload, b"B:/~BUN/root/app.js");
+        let contents = append_blob(&mut payload, b"export default 1;\n");
+        let graph = build_graph(
+            payload,
+            vec![modern_record(
+                name,
+                contents,
+                StringPointer {
+                    offset: 0,
+                    length: 0,
+                },
+                StringPointer {
+                    offset: 0,
+                    length: 0,
+                },
+                StringPointer {
+                    offset: 0,
+                    length: 0,
+                },
+                EnumBytes {
+                    encoding: ENC_LATIN1,
+                    loader: LOADER_JS,
+                    module_format: FORMAT_ESM,
+                    side: SIDE_SERVER,
+                },
+            )],
+        );
+
+        let parsed = BunBinary::parse(&appended_binary(&graph)).unwrap();
+        assert_eq!(parsed.modules[0].name, "B:/~BUN/root/app.js");
+        assert_eq!(parsed.modules[0].relative_path(), "app.js");
+        assert_eq!(parsed.modules[0].loader, Loader::Js);
+    }
+
+    #[test]
+    fn parses_pe_elf_and_macho_section_embeddings() {
+        let graph = modern_graph_with_two_modules();
+
+        let pe = BunBinary::parse(&minimal_pe_with_bun_section(&graph)).unwrap();
+        assert!(matches!(pe.embed_method, EmbedMethod::PeSection { .. }));
+        assert_eq!(pe.modules.len(), 2);
+        assert_eq!(pe.modules[0].loader, Loader::Md);
+
+        let elf = BunBinary::parse(&minimal_elf_with_bun_section(&graph)).unwrap();
+        assert!(matches!(elf.embed_method, EmbedMethod::ElfSection { .. }));
+        assert_eq!(elf.modules.len(), 2);
+        assert_eq!(elf.modules[1].loader, Loader::Json5);
+
+        let macho = BunBinary::parse(&minimal_macho_with_bun_section(&graph)).unwrap();
+        assert!(matches!(
+            macho.embed_method,
+            EmbedMethod::MachoSection { .. }
+        ));
+        assert_eq!(macho.modules.len(), 2);
+        assert_eq!(
+            macho.modules[1].module_info.as_deref(),
+            Some(b"module-info-1".as_slice())
+        );
+    }
+
+    #[test]
+    fn default_enum_fields_are_used_only_when_candidates_are_invalid() {
+        let mut record = vec![0xff; 52];
+        let (encoding, loader, module_format, side) = extract_enum_fields(&record, 0, 52);
+        assert_eq!(encoding, Encoding::Binary);
+        assert_eq!(loader, Loader::File);
+        assert_eq!(module_format, ModuleFormat::None);
+        assert_eq!(side, FileSide::Server);
+
+        record[48] = ENC_BINARY;
+        record[49] = LOADER_JSX;
+        record[50] = FORMAT_NONE;
+        record[51] = SIDE_SERVER;
+        let (_, loader, _, _) = extract_enum_fields(&record, 0, 52);
+        assert_eq!(loader, Loader::Jsx);
+    }
 }

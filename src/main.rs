@@ -1,7 +1,13 @@
-use std::path::{Component, PathBuf};
+use std::path::PathBuf;
 use std::{fs, process};
 
 use bun_binary_extractor::extractor::BunBinary;
+use bun_binary_extractor::format::{
+    BUNFS_PREFIX_UNIX,
+    BUNFS_PREFIX_WIN,
+    BUNFS_PREFIX_WIN_PUBLIC,
+    MODULE_NAME_PREFIX,
+};
 use bun_binary_extractor::sourcemap::BunSourceMap;
 use clap::Parser;
 use regex::Regex;
@@ -44,6 +50,14 @@ struct Cli {
     /// Regex pattern to filter which sourcemap sources to extract (e.g., "^src/" to exclude node_modules)
     #[arg(long, value_name = "REGEX")]
     filter_sources: Option<String>,
+
+    /// Extract bytecode blobs (Bun precompiled bytecode, can be 100MB+)
+    #[arg(long)]
+    extract_bytecode: bool,
+
+    /// Extract module info blobs used by Bun bytecode metadata
+    #[arg(long)]
+    extract_module_info: bool,
 }
 
 fn main() {
@@ -108,9 +122,19 @@ fn run(cli: &Cli, filter_regex: Option<&Regex>) -> Result<(), Box<dyn std::error
             .as_ref()
             .map(|sm| format!(" (sourcemap: {} bytes)", sm.len()))
             .unwrap_or_default();
+        let bc_info = module
+            .bytecode
+            .as_ref()
+            .map(|bc| format!(" (bytecode: {:.1} MB)", bc.len() as f64 / 1_048_576.0))
+            .unwrap_or_default();
+        let mi_info = module
+            .module_info
+            .as_ref()
+            .map(|mi| format!(" (module_info: {} bytes)", mi.len()))
+            .unwrap_or_default();
 
         println!(
-            "  [{:>2}] {} ({}, {} bytes, {}, {}, {}){}{sm_info}",
+            "  [{:>2}] {} ({}, {} bytes, {}, {}, {}){}{sm_info}{bc_info}{mi_info}",
             module.index,
             module.name,
             module.file_type(),
@@ -120,6 +144,12 @@ fn run(cli: &Cli, filter_regex: Option<&Regex>) -> Result<(), Box<dyn std::error
             module.module_format.as_str(),
             entry_marker,
         );
+
+        if cli.verbose {
+            if let Some(ref path) = module.bytecode_origin_path {
+                println!("       bytecode_origin_path: {path}");
+            }
+        }
     }
 
     if cli.list {
@@ -138,19 +168,11 @@ fn run(cli: &Cli, filter_regex: Option<&Regex>) -> Result<(), Box<dyn std::error
             continue;
         }
 
-        let rel_path = module.relative_path();
-        let rel = std::path::Path::new(rel_path);
-        let has_unsafe_component = rel.components().any(|c| {
-            matches!(
-                c,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        });
-        if has_unsafe_component {
+        let Some(rel_path) = output_relative_path(&module.name) else {
             eprintln!("  Skipping module with unsafe path: {}", module.name);
             continue;
-        }
-        let out_path = cli.output.join(rel_path);
+        };
+        let out_path = cli.output.join(&rel_path);
 
         if let Some(parent) = out_path.parent() {
             fs::create_dir_all(parent)?;
@@ -218,8 +240,141 @@ fn run(cli: &Cli, filter_regex: Option<&Regex>) -> Result<(), Box<dyn std::error
                 }
             }
         }
+
+        // Extract bytecode blob if --extract-bytecode is set
+        if cli.extract_bytecode {
+            if let Some(ref bytecode) = module.bytecode {
+                let mut bc_name = out_path.as_os_str().to_owned();
+                bc_name.push(".bytecode");
+                let bc_path = PathBuf::from(bc_name);
+                fs::write(&bc_path, bytecode)?;
+                if cli.verbose {
+                    println!(
+                        "  Wrote {} ({:.1} MB, Bun bytecode)",
+                        bc_path.display(),
+                        bytecode.len() as f64 / 1_048_576.0
+                    );
+                } else {
+                    println!(
+                        "  Bytecode: {} ({:.1} MB)",
+                        bc_path.display(),
+                        bytecode.len() as f64 / 1_048_576.0
+                    );
+                }
+            }
+        }
+
+        if cli.extract_module_info {
+            if let Some(ref module_info) = module.module_info {
+                let mut info_name = out_path.as_os_str().to_owned();
+                info_name.push(".module_info");
+                let info_path = PathBuf::from(info_name);
+                fs::write(&info_path, module_info)?;
+                if cli.verbose {
+                    println!(
+                        "  Wrote {} ({} bytes, Bun module info)",
+                        info_path.display(),
+                        module_info.len()
+                    );
+                } else {
+                    println!(
+                        "  Module info: {} ({} bytes)",
+                        info_path.display(),
+                        module_info.len()
+                    );
+                }
+            }
+        }
     }
 
     println!("Extracted {extracted} files.");
     Ok(())
+}
+
+fn output_relative_path(module_name: &str) -> Option<PathBuf> {
+    if module_name.as_bytes().contains(&0) {
+        return None;
+    }
+
+    let (mut rel, is_bun_virtual) = if let Some(rel) = module_name.strip_prefix(BUNFS_PREFIX_UNIX) {
+        (rel, true)
+    } else if let Some(rel) = module_name.strip_prefix(MODULE_NAME_PREFIX) {
+        (rel, true)
+    } else if let Some(rel) = module_name.strip_prefix(BUNFS_PREFIX_WIN) {
+        (rel, true)
+    } else if let Some(rel) = module_name.strip_prefix(BUNFS_PREFIX_WIN_PUBLIC) {
+        (rel, true)
+    } else {
+        (module_name, false)
+    };
+
+    if is_bun_virtual {
+        rel = rel
+            .strip_prefix("root/")
+            .or_else(|| rel.strip_prefix("root\\"))
+            .unwrap_or(rel);
+    } else if rel.starts_with('/') || rel.starts_with('\\') {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+    for part in rel.split(['/', '\\']) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if parts.pop().is_none() && !is_bun_virtual {
+                    return None;
+                }
+            }
+            _ if part.contains(':') => return None,
+            _ => parts.push(part),
+        }
+    }
+
+    if parts.is_empty() {
+        return None;
+    }
+
+    let mut path = PathBuf::new();
+    for part in parts {
+        path.push(part);
+    }
+    Some(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::output_relative_path;
+
+    #[test]
+    fn strips_bun_root_prefix() {
+        assert_eq!(
+            output_relative_path("/$bunfs/root/src/index.js"),
+            Some(PathBuf::from("src/index.js"))
+        );
+    }
+
+    #[test]
+    fn keeps_virtual_dependency_paths_inside_output_dir() {
+        assert_eq!(
+            output_relative_path(
+                "/$bunfs/root/../../node_modules/.bun/pkg/node_modules/pkg/parser.worker.js"
+            ),
+            Some(PathBuf::from(
+                "node_modules/.bun/pkg/node_modules/pkg/parser.worker.js"
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_host_parent_escapes() {
+        assert_eq!(output_relative_path("../../etc/passwd"), None);
+    }
+
+    #[test]
+    fn rejects_host_absolute_paths() {
+        assert_eq!(output_relative_path("/etc/passwd"), None);
+    }
 }
